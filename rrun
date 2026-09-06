@@ -4,7 +4,7 @@
 # so a dropped connection never kills it; the local side reconnects and keeps streaming.
 set -euo pipefail
 
-VERSION=0.3.0
+VERSION=0.3.1
 HOME_CFG="${RRUN_CONFIG:-$HOME/.config/rrun/config}"
 
 say() { printf '\033[1;36m[rrun]\033[0m %s\n' "$*" >&2; }
@@ -95,9 +95,7 @@ done
 [ -n "$spec" ] || spec="$(cfg default)"
 [ -n "$spec" ] || die "no host: pass -H <user@host [ssh options]> or set default= in $HOME_CFG"
 first="${spec%% *}"
-if [ -n "$(cfg "$first")" ]; then spec="$(cfg "$first")${spec#"$first"}"
-elif [ -f "$HOME_CFG" ]; then case "$first" in *@*|*.*|*:*) ;; *) say "'$first' is not in $HOME_CFG; using it as an ssh host" ;; esac
-fi
+if [ -n "$(cfg "$first")" ]; then spec="$(cfg "$first")${spec#"$first"}"; fi
 target="${spec%% *}"; ssh_extra="${spec#"$target"}"
 name="${name:-$(basename "$ROOT")}"
 run="${run:-default}"; key="$name/$run"   # state lives at ~/.rrun/<project>/<run>/ on the host
@@ -220,7 +218,17 @@ r_setup() {  # dir
 }
 R_LIB=$(declare -f r_label r_pgid r_stop r_gone r_start r_follow r_exit r_status r_ps r_killall r_clean r_setup)
 
+# one probe per invocation: a host that is down or misnamed fails here with ssh's reason on one line,
+# instead of surfacing later as a wall of rsync errors; it also opens the multiplexed connection
+checked=""
+check_host() {
+    [ -z "$checked" ] || return 0
+    local err; err=$(mktemp)
+    "${SSH[@]}" -o ConnectTimeout=15 true 2>"$err" || die "cannot reach $target: $(grep -v '^[[:space:]]*$' "$err" | tail -n 1)"
+    rm -f "$err"; checked=1
+}
 remote() {  # run one r_* function on the host; args are re-quoted so spaces survive
+    check_host
     "${SSH[@]}" bash -s <<REMOTE
 $R_LIB
 $(printf '%q ' "$@")
@@ -231,8 +239,9 @@ REMOTE
 label="$(r_label "$key")"
 
 sync() {
+    check_host
     say "syncing $ROOT -> $target:$dir"
-    local ex; ex=$(mktemp); local inc=() exc=() l
+    local ex; ex=$(mktemp); local err; err=$(mktemp); local inc=() exc=() l
     if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         # everything git ignores stays local, except env files
         git -C "$ROOT" ls-files -o -i --exclude-standard --directory | grep -vE '(^|/)\.env(\.local)?$' | sed 's|^|/|' > "$ex" || true
@@ -246,9 +255,10 @@ sync() {
     local i=0 f
     for f in ${filt_paths[@]+"${filt_paths[@]}"}; do exc+=(--exclude="/$f"); done
     rsync -az --delete -v -e "ssh $SSH_OPTS" --rsync-path="mkdir -p $dir && rsync" ${inc[@]+"${inc[@]}"} ${exc[@]+"${exc[@]}"} --exclude-from="$ex" \
-        "$ROOT/" "$target:$dir/" \
-        | awk '/\/$/ {next} /^(sent|total|building|Transfer|deleting|receiving|sending)/ {next} NF {print "  " $0; n++} END {printf "  %d file(s) changed\n", n}' >&2
-    rm -f "$ex"
+        "$ROOT/" "$target:$dir/" 2>"$err" \
+        | awk '/\/$/ {next} /^(sent|total|building|Transfer|deleting|receiving|sending)/ {next} NF {print "  " $0; n++} END {printf "  %d file(s) changed\n", n}' >&2 \
+        || die "rsync to $target:$dir failed: $(grep -vE '^rsync\(|^[[:space:]]*$' "$err" | head -n 1) (no rsync on the host? try: rrun setup)"
+    rm -f "$ex" "$err"
     while [ "$i" -lt "${#filt_paths[@]}" ]; do
         f="${filt_paths[$i]}"
         if [ -f "$ROOT/$f" ]; then
@@ -304,9 +314,9 @@ case "${1:-}" in
     ps)          case "${2:-}" in -a|all) remote r_ps ;; *) remote r_ps "$name" ;; esac ;;
     clean)       if [ -n "${2:-}" ]; then remote r_clean "$name/$2"; else remote r_clean "$name"; fi ;;
     killall)     remote r_killall ;;
-    exec)        shift; [ $# -gt 0 ] || die "exec: no command"
+    exec)        shift; [ $# -gt 0 ] || die "exec: no command"; check_host
                  "${SSH[@]}" -t "cd $dir && ${env:+export $env &&} bash -lc $(printf '%q' "$*")" ;;
-    sh|shell)    "${SSH[@]}" -t "cd $dir && exec bash -l" ;;
+    sh|shell)    check_host; "${SSH[@]}" -t "cd $dir && exec bash -l" ;;
     init)        [ -e "$ROOT/.rrun.conf" ] && die ".rrun.conf already exists in $ROOT"
                  cat > "$ROOT/.rrun.conf" <<'TPL'
 # rrun project config (sourced by bash). Every line is optional.
