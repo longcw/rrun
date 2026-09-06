@@ -19,11 +19,14 @@ $ rrun uv run python examples/voice_agents/basic_agent.py dev
 
 ## Install
 
+rrun is one bash script. The installer copies it to `~/.local/bin/rrun` and seeds `~/.config/rrun/config`; it keeps no checkout.
+
 ```
-git clone git@github.com:longcw/rrun.git ~/code/rrun && ~/code/rrun/install.sh
+gh api repos/longcw/rrun/contents/install.sh -H 'Accept: application/vnd.github.raw' | bash   # while the repo is private
+curl -fsSL https://raw.githubusercontent.com/longcw/rrun/main/install.sh | bash               # once it is public
 ```
 
-This symlinks `rrun` into `~/.local/bin` and copies `config.example` to `~/.config/rrun/config` if you have none (edit it, or skip it and use `-H`). Requirements: bash 3.2+, ssh, rsync locally; bash, rsync, `setsid` on the host (`rrun setup` installs rsync with apt, dnf, yum, apk, or pacman).
+From a checkout, `./install.sh` does the same. `rrun update` re-runs the installer over the installed copy. Requirements: bash 3.2+, ssh, rsync locally; bash, rsync, `setsid` on the host (`rrun setup` installs rsync with apt, dnf, yum, apk, or pacman).
 
 ## Commands
 
