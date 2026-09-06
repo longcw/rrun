@@ -4,7 +4,7 @@
 # so a dropped connection never kills it; the local side reconnects and keeps streaming.
 set -euo pipefail
 
-VERSION=0.3.1
+VERSION=0.4.0
 HOME_CFG="${RRUN_CONFIG:-$HOME/.config/rrun/config}"
 
 say() { printf '\033[1;36m[rrun]\033[0m %s\n' "$*" >&2; }
@@ -41,7 +41,8 @@ Commands are joined and run with `bash -lc` in the remote project dir, so quote 
 
 Hosts: -H takes an ssh target plus ssh options (rrun -H root@vps -p 2222 -i ~/.ssh/k <cmd>), or a
 name from ~/.config/rrun/config, which is a list of `name = target [ssh options]` lines plus
-`default = name` and optionally `root = <parent folder for all projects on the host>`. Project: .rrun.conf in the root (host, dir, name, env, filter lines) and
+`default = name`, optionally `root = <parent folder for projects on the host>` and `log_max = 50M`
+(run logs rotate past this size, keeping one previous copy; 0 disables). Project: .rrun.conf in the root (host, dir, name, env, filter lines) and
 .rrunignore (gitignore-like, `!pattern` re-includes). Git-ignored files are not synced, except
 .env and .env.local.
 USAGE
@@ -58,7 +59,7 @@ find_root() {
 }
 
 ROOT=$(find_root)
-host="" dir="" name="" env="" filt_paths=() filt_cmds=()
+host="" dir="" name="" env="" log_max="" filt_paths=() filt_cmds=()
 # `filter <file> <command>` in .rrun.conf: the file is not rsynced; it is piped through the command
 # (a function from the conf or any shell command) and the output written to the same path on the host
 filter() { filt_paths+=("$1"); filt_cmds+=("$2"); }
@@ -99,6 +100,13 @@ if [ -n "$(cfg "$first")" ]; then spec="$(cfg "$first")${spec#"$first"}"; fi
 target="${spec%% *}"; ssh_extra="${spec#"$target"}"
 name="${name:-$(basename "$ROOT")}"
 run="${run:-default}"; key="$name/$run"   # state lives at ~/.rrun/<project>/<run>/ on the host
+log_max="${log_max:-$(cfg log_max)}"; log_max="${log_max:-50M}"
+case "$log_max" in
+    *[Gg]) log_bytes=$(( ${log_max%[Gg]} * 1024 * 1024 * 1024 )) ;;
+    *[Mm]) log_bytes=$(( ${log_max%[Mm]} * 1024 * 1024 )) ;;
+    *[Kk]) log_bytes=$(( ${log_max%[Kk]} * 1024 )) ;;
+    *) log_bytes=$(( log_max )) ;;
+esac
 if [ -n "$dir_arg" ]; then
     dir="$dir_arg"
     case "$dir" in "$HOME"/*) dir="~${dir#"$HOME"}" ;; esac   # `~/x` was expanded by the local shell
@@ -125,36 +133,46 @@ r_label() { case "$1" in */default) echo "${1%/default}" ;; *) echo "${1%/*}:${1
 r_pgid() { local p; p=$(cat "$HOME/.rrun/$1/pid" 2>/dev/null) && kill -0 -- "-$p" 2>/dev/null && echo "$p"; }
 r_stop() { local p; p=$(r_pgid "$1") || return 0; kill "-$2" -- "-$p" 2>/dev/null || true; }
 r_gone() { local i; for i in $(seq "$2"); do r_pgid "$1" >/dev/null || return 0; sleep 0.3; done; return 1; }
-r_start() {  # name dir env command
-    local n=$1 d env=$3 cmd=$4 st="$HOME/.rrun/$1"; eval "d=$2"
+r_start() {  # key dir env log_max_bytes command
+    local n=$1 d env=$3 max=$4 cmd=$5 st="$HOME/.rrun/$1"; eval "d=$2"
     mkdir -p "$st"
     r_stop "$n" INT; r_gone "$n" 200 || r_stop "$n" KILL
-    : > "$st/log"; rm -f "$st/exit"; printf '%s\n' "$cmd" > "$st/cmd"
+    : > "$st/log"; rm -f "$st/exit" "$st/log.1" "$st/gen"; printf '%s\n' "$cmd" > "$st/cmd"
     cd "$d" 2>/dev/null || { echo "[rrun] remote dir $d is missing; run: rrun setup"; return 1; }
     [ -n "$env" ] && eval "export $env"
     # the wrapper stays the group leader; the INT trap keeps it alive to record the exit code.
+    # a side loop rotates the log by copy + truncate when it passes $max bytes (the command keeps
+    # its open fd; O_APPEND makes writes continue at the new end) and counts rotations in "gen"
+    local w='st=$1 max=$2; shift 2; trap ":" INT; echo $$ > "$st/pid"
+        if [ "$max" -gt 0 ]; then ( trap "" INT; while sleep 5; do
+            sz=$(stat -c %s "$st/log" 2>/dev/null || wc -c < "$st/log"); [ "$sz" -gt "$max" ] || continue
+            cp "$st/log" "$st/log.1" && : > "$st/log"; echo $(( $(cat "$st/gen" 2>/dev/null || echo 0) + 1 )) > "$st/gen"
+        done ) & fi
+        bash -lc "$1"; echo $? > "$st/exit"; pkill -P $! 2>/dev/null; kill $! 2>/dev/null'
     # setsid --fork rather than `&`: a shell background job inherits SIGINT ignored, and that
     # would pass down to the command, so Ctrl-C could never stop it
-    local w='st=$1; shift; trap ":" INT; echo $$ > "$st/pid"; bash -lc "$1"; echo $? > "$st/exit"'
     if setsid --help 2>&1 | grep -q -- --fork; then
-        setsid -f bash -c "$w" _ "$st" "$cmd" >> "$st/log" 2>&1 < /dev/null
+        setsid -f bash -c "$w" _ "$st" "$max" "$cmd" >> "$st/log" 2>&1 < /dev/null
     else
-        setsid bash -c "$w" _ "$st" "$cmd" >> "$st/log" 2>&1 < /dev/null &
+        setsid bash -c "$w" _ "$st" "$max" "$cmd" >> "$st/log" 2>&1 < /dev/null &
     fi
     local i; for i in $(seq 50); do { r_pgid "$n" >/dev/null || [ -e "$st/exit" ]; } && break; sleep 0.1; done
 }
-r_follow() {  # name from   (from < 0: last 200 lines); exits 0 once the run is over
-    local st="$HOME/.rrun/$1" from=$2 p t total
+r_follow() {  # key from   (from = "gen:lines", or -1 for the last 200 lines); exits 0 once the run is over
+    local st="$HOME/.rrun/$1" from=$2 p t total gen lines
     [ -e "$st/log" ] || { echo "[rrun] no run $(r_label "$1") on $(hostname)"; return 0; }
+    gen=$(cat "$st/gen" 2>/dev/null || echo 0)
     total=$(wc -l < "$st/log")
-    [ "$from" -lt 0 ] && from=$(( total > 200 ? total - 200 : 0 ))
-    printf '\001rrun:from=%s\n' "$from"
+    if [ "$from" = "-1" ]; then lines=$(( total > 200 ? total - 200 : 0 ))
+    elif [ "${from%%:*}" = "$gen" ]; then lines=${from#*:}
+    else lines=0; echo "[rrun] log was rotated, continuing from the current file"; fi
+    printf '\001rrun:from=%s gen=%s\n' "$lines" "$gen"
     if p=$(r_pgid "$1"); then
-        tail -n +$((from + 1)) -f "$st/log" & t=$!
+        tail -n +$((lines + 1)) -f "$st/log" 2>/dev/null & t=$!
         while kill -0 -- "-$p" 2>/dev/null; do sleep 0.3; done
         sleep 0.5; kill "$t" 2>/dev/null; wait "$t" 2>/dev/null || true
     else
-        tail -n +$((from + 1)) "$st/log"
+        tail -n +$((lines + 1)) "$st/log"
     fi
     if [ -e "$st/exit" ]; then echo "[rrun] $(r_label "$1") exited with code $(cat "$st/exit")"; else echo "[rrun] $(r_label "$1") exited (killed)"; fi
 }
@@ -270,7 +288,7 @@ sync() {
     say "synced"
 }
 
-# stream the remote log from line $1 until the run is over; survives Ctrl-C and dropped connections
+# stream the remote log from $1 (gen:lines, or -1 for the tail) until the run is over; survives Ctrl-C and dropped connections
 follow() {
     local from=$1 hits=0 cnt pid rc
     cnt=$(mktemp)
@@ -280,8 +298,8 @@ follow() {
         # it keeps the count of lines shown so a reconnect resumes where the stream broke
         ( trap '' INT
           remote r_follow "$key" "$from" | awk -v f="$cnt" '
-              !seen { seen = 1; if (index($0, "\001rrun:from=") == 1) { base = substr($0, 12) + 0; next } }
-              { print; fflush(); n++; printf "%d\n", base + n > f; close(f) }'
+              !seen { seen = 1; if (index($0, "\001rrun:from=") == 1) { split($0, a, /[= ]/); base = a[2] + 0; gen = a[4]; next } }
+              { print; fflush(); n++; printf "%s:%d\n", gen, base + n > f; close(f) }'
           exit "${PIPESTATUS[0]}" ) & pid=$!
         while :; do wait "$pid" && rc=0 || rc=$?; kill -0 "$pid" 2>/dev/null || break; done
         [ "$rc" -eq 0 ] && break
@@ -297,8 +315,8 @@ run() {
     [ $# -gt 0 ] || { usage; exit 1; }
     sync
     say "starting $label on $target: $*"
-    remote r_start "$key" "$dir" "$env" "$*"
-    follow 0
+    remote r_start "$key" "$dir" "$env" "$log_bytes" "$*"
+    follow 0:0
     exit "$(remote r_exit "$key")"
 }
 # subcommands that take a run name positionally, docker style: rrun attach load
@@ -324,6 +342,7 @@ case "${1:-}" in
 # dir=~/rrun/<name>        # where the project lives on the host (`rrun -d <dir>` writes this line)
 # name=<dir basename>      # key for the run state under ~/.rrun/<name> on the host
 # env=""                   # exported before every remote command, e.g. env="UV_PYTHON=3.13"
+# log_max=50M              # rotate the run log past this size (one previous copy kept as log.1); 0 = never
 # filter .env "sed 's/^API_URL=.*/API_URL=https:\/\/prod.example/'"
 #                          # a file is not rsynced but piped through a command (or a function defined
 #                          # here) and the output written to the same path on the host; repeatable

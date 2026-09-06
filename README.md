@@ -76,6 +76,7 @@ vps = root@vps.example.com -p 22 -i ~/.ssh/id_ed25519
 gpu = me@gpu-box
 default = vps
 root = ~/rrun
+log_max = 50M
 ```
 
 Then `rrun -H gpu ...`, or just `rrun ...` for the default. `root` is the parent folder for every project on the host: a project syncs to `<root>/<folder name>` unless `.rrun.conf` or `-d` says otherwise (default `~/rrun`). Connections are multiplexed through `~/.rrun/cm-*`, so repeated calls cost a few milliseconds.
@@ -86,12 +87,15 @@ Then `rrun -H gpu ...`, or just `rrun ...` for the default. `root` is the parent
 host=vps                                      # a name from the config, or "user@host [ssh options]"
 dir=~/agents                                  # default: <root>/<folder name>; `rrun -d ~/agents ...` writes this line
 env="UV_PYTHON=3.13 PYTHONUNBUFFERED=1"       # exported before every remote command
+log_max=200M                                  # overrides the config's log_max for this project
 filter .env "sed 's/^API_URL=.*/API_URL=https:\/\/prod.example/'"
 filter config.yaml to_prod                     # any command, or a function defined in this file
 to_prod() { sed 's/localhost/0.0.0.0/'; }
 ```
 
 The project root is the nearest parent with a `.rrun.conf`, else the git top level, else the current directory. Its basename is the project `name`; each run keeps its state on the host under `~/.rrun/<name>/<run>/` (`log`, `pid`, `cmd`, `exit`; the default run is `default`), which stays after the run ends until that slot is started again or `rrun clean` removes it.
+
+Logs rotate: when a run's log passes `log_max` (default 50M, settable in the config or per project, `0` disables), it is copied to `log.1` and truncated in place, so at most two files of that size exist per run. The process keeps writing to the same open file. A follower that reconnects after a rotation says so and continues from the current file.
 
 A `filter <file> <command>` line takes that file out of rsync; instead the local file is piped through the command and the output is written to the same path on the host. Use it when the same checkout should point at a different backend from the host, for example to activate a different block of `.env`. Repeat the line for more files.
 
