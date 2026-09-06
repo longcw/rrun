@@ -25,6 +25,7 @@ chmod +x "$bin/rrun"
 # `rrun -H <name>` picks one; `rrun -H user@host -p 22 -i ~/.ssh/key <cmd>` needs no entry here.
 # vps = root@vps.example.com -p 22 -i ~/.ssh/id_ed25519
 # default = vps
+# root = ~/rrun      # parent folder for projects on the host; a project lands in <root>/<folder name>
 CFG
 
 echo "installed $("$bin/rrun" -V) at $bin/rrun; hosts: ~/.config/rrun/config"

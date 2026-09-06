@@ -4,7 +4,7 @@
 # so a dropped connection never kills it; the local side reconnects and keeps streaming.
 set -euo pipefail
 
-VERSION=0.1.3
+VERSION=0.1.4
 HOME_CFG="${RRUN_CONFIG:-$HOME/.config/rrun/config}"
 
 say() { printf '\033[1;36m[rrun]\033[0m %s\n' "$*" >&2; }
@@ -12,7 +12,8 @@ die() { printf '\033[1;31m[rrun]\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
     cat <<'USAGE'
-rrun [-H host] <command...>     sync the project, run <command> on the remote, stream its logs
+rrun [-H host] [-d dir] <command...>
+                                sync the project, run <command> on the remote, stream its logs
                                 Ctrl-C once stops it (SIGINT) and streams until it has exited; twice kills it
 
   attach | logs                 re-attach to the running command's logs (last 200 lines, then follow)
@@ -27,13 +28,15 @@ rrun [-H host] <command...>     sync the project, run <command> on the remote, s
   setup                         install rsync on the host if missing and create the project dir
   init                          write a .rrun.conf template into the project
   update                        reinstall the latest rrun from GitHub
+  -d <dir>                      remote folder for this project; saved to .rrun.conf for next time
+                                (default: <root>/<folder name>, root = ~/rrun or `root = ...` in the config)
 
 Commands are joined and run with `bash -lc` in the remote project dir, so quote pipes:
   rrun 'curl -LsSf https://astral.sh/uv/install.sh | sh'
 
 Hosts: -H takes an ssh target plus ssh options (rrun -H root@vps -p 2222 -i ~/.ssh/k <cmd>), or a
 name from ~/.config/rrun/config, which is a list of `name = target [ssh options]` lines plus
-`default = name`. Project: .rrun.conf in the root (host, dir, name, env, env_filter) and
+`default = name` and optionally `root = <parent folder for all projects on the host>`. Project: .rrun.conf in the root (host, dir, name, env, env_filter) and
 .rrunignore (gitignore-like, `!pattern` re-includes). Git-ignored files are not synced, except
 .env and .env.local.
 USAGE
@@ -55,9 +58,10 @@ host="" dir="" name="" env=""
 [ -f "$ROOT/.rrun.conf" ] && . "$ROOT/.rrun.conf"
 cfg() { [ -f "$HOME_CFG" ] || return 0; sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$HOME_CFG" | tail -n 1; }
 
-spec="${RRUN_HOST:-}"
+spec="${RRUN_HOST:-}" dir_arg=""
 while [ $# -gt 0 ]; do
     case "$1" in
+        -d|--dir) dir_arg="$2"; shift 2 ;;
         -H|--host)
             spec="$2"; shift 2
             # ssh options right after the target belong to it: rrun -H root@vps -p 2222 -i ~/.ssh/k <cmd>
@@ -84,7 +88,20 @@ first="${spec%% *}"
 if [ -n "$(cfg "$first")" ]; then spec="$(cfg "$first")${spec#"$first"}"; fi
 target="${spec%% *}"; ssh_extra="${spec#"$target"}"
 name="${name:-$(basename "$ROOT")}"
-dir="${dir:-~/rrun/$name}"
+if [ -n "$dir_arg" ]; then
+    dir="$dir_arg"
+    case "$dir" in "$HOME"/*) dir="~${dir#"$HOME"}" ;; esac   # `~/x` was expanded by the local shell
+    # remember it: replace an existing dir= line in .rrun.conf or append one
+    if [ -f "$ROOT/.rrun.conf" ] && grep -q '^dir=' "$ROOT/.rrun.conf"; then
+        awk -v d="$dir" '/^dir=/ { print "dir=\047" d "\047"; next } { print }' "$ROOT/.rrun.conf" > "$ROOT/.rrun.conf.tmp" \
+            && mv "$ROOT/.rrun.conf.tmp" "$ROOT/.rrun.conf"
+    else
+        printf "dir='%s'\n" "$dir" >> "$ROOT/.rrun.conf"
+    fi
+    say "remote dir $dir saved to $ROOT/.rrun.conf"
+fi
+root="$(cfg root)"; root="${root:-~/rrun}"
+dir="${dir:-$root/$name}"
 case "$dir" in "$HOME"/*) dir="~${dir#"$HOME"}" ;; esac   # `dir=~/x` in a conf expands locally; undo that
 mkdir -p "$HOME/.rrun"
 SSH_OPTS="-o ControlMaster=auto -o ControlPath=~/.rrun/cm-%C -o ControlPersist=10m $ssh_extra"
@@ -248,7 +265,7 @@ case "${1:-}" in
                  cat > "$ROOT/.rrun.conf" <<'TPL'
 # rrun project config (sourced by bash). Every line is optional.
 # host=vps                 # a name from ~/.config/rrun/config, or "user@host [ssh options]"
-# dir=~/rrun/<name>        # where the project lives on the host
+# dir=~/rrun/<name>        # where the project lives on the host (`rrun -d <dir>` writes this line)
 # name=<dir basename>      # key for the run state under ~/.rrun/<name> on the host
 # env=""                   # exported before every remote command, e.g. env="UV_PYTHON=3.13"
 # env_filter() { cat; }    # if defined, .env is piped through it on the way to the host

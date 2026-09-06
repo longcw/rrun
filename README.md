@@ -44,6 +44,7 @@ or `git clone https://github.com/longcw/rrun && rrun/install.sh`. `rrun update` 
 | `rrun setup` | install rsync on the host if missing, create the project dir, sync |
 | `rrun init` | write a commented `.rrun.conf` template |
 | `rrun -H <host> ...` | use another host for this invocation |
+| `rrun -d <dir> ...` | use this remote folder for the project and remember it in `.rrun.conf` |
 
 While streaming, the first Ctrl-C sends SIGINT to the remote process group and keeps streaming until the group is gone. A second Ctrl-C sends SIGKILL. If the ssh stream dies, rrun reconnects and resumes from the last line it printed. Starting a new run first stops the previous one for the same project.
 
@@ -68,15 +69,16 @@ rrun -H root@vps.example.com -p 2222 -i ~/.ssh/id_ed25519 uv run python agent.py
 vps = root@vps.example.com -p 22 -i ~/.ssh/id_ed25519
 gpu = me@gpu-box
 default = vps
+root = ~/rrun
 ```
 
-Then `rrun -H gpu ...`, or just `rrun ...` for the default. Connections are multiplexed through `~/.rrun/cm-*`, so repeated calls cost a few milliseconds.
+Then `rrun -H gpu ...`, or just `rrun ...` for the default. `root` is the parent folder for every project on the host: a project syncs to `<root>/<folder name>` unless `.rrun.conf` or `-d` says otherwise (default `~/rrun`). Connections are multiplexed through `~/.rrun/cm-*`, so repeated calls cost a few milliseconds.
 
 **`.rrun.conf`** in the project root (optional, bash syntax) pins the project:
 
 ```bash
 host=vps                                      # a name from the config, or "user@host [ssh options]"
-dir=~/agents                                  # default: ~/rrun/<folder name>
+dir=~/agents                                  # default: <root>/<folder name>; `rrun -d ~/agents ...` writes this line
 env="UV_PYTHON=3.13 PYTHONUNBUFFERED=1"       # exported before every remote command
 env_filter() { sed 's/^LIVEKIT_URL=.*/LIVEKIT_URL=wss:\/\/prod.example/'; }   # optional
 ```
