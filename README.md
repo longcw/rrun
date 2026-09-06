@@ -115,6 +115,8 @@ data/          # never upload
 
 A folder that is not a git repo is synced whole, minus `.rrunignore`.
 
+Symlinks that point inside the project stay symlinks on the host. A symlink that points outside, such as an `.env` linked from a shared location, is copied as a regular file with the target's content. A dangling link is skipped with a warning.
+
 ## How it works
 
 Each ssh call ships a small bash library with `declare -f` and runs one function with `bash -s`, so nothing is installed on the host. The command is started with `setsid --fork` under a wrapper that traps SIGINT, records the exit code, and stays the process-group leader, so `kill -- -pgid` reaches the whole tree. `--fork` matters: a shell background job would inherit SIGINT as ignored and pass that down to the command. The local side tails the log through ssh in a subshell that ignores SIGINT, counts the lines it has shown, and reconnects from that line if the stream breaks.
