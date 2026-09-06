@@ -23,7 +23,7 @@ $ rrun uv run python examples/voice_agents/basic_agent.py dev
 git clone git@github.com:longcw/rrun.git ~/code/rrun && ~/code/rrun/install.sh
 ```
 
-This symlinks `rrun` into `~/.local/bin` and copies `config.example` to `~/.config/rrun/config` if you have none. Requirements: bash 3.2+, ssh, rsync locally; bash, rsync, `setsid` on the host (`rrun setup` installs rsync with apt, dnf, yum, apk, or pacman).
+This symlinks `rrun` into `~/.local/bin` and copies `config.example` to `~/.config/rrun/config` if you have none (edit it, or skip it and use `-H`). Requirements: bash 3.2+, ssh, rsync locally; bash, rsync, `setsid` on the host (`rrun setup` installs rsync with apt, dnf, yum, apk, or pacman).
 
 ## Commands
 
@@ -54,20 +54,26 @@ rrun exec uv sync --all-extras --dev
 
 ## Config
 
-**`~/.config/rrun/config`** names your hosts (bash syntax):
+No config is needed: give `-H` an ssh target and any ssh options, and the command after them.
 
-```bash
-default=vps
-host_vps=root@us.long-ch.com
-# ssh_opts_vps="-p 2222"
+```
+rrun -H root@vps.example.com -p 2222 -i ~/.ssh/id_ed25519 uv run python agent.py dev
 ```
 
-A host name that is not defined here is used as an ssh target as-is, so `rrun -H me@box ...` works without config. Connections are multiplexed through `~/.rrun/cm-*`, so repeated calls cost a few milliseconds.
+**`~/.config/rrun/config`** gives hosts a name, one `name = target [ssh options]` per line, plus which one is the default:
+
+```
+vps = root@vps.example.com -p 22 -i ~/.ssh/id_ed25519
+gpu = me@gpu-box
+default = vps
+```
+
+Then `rrun -H gpu ...`, or just `rrun ...` for the default. Connections are multiplexed through `~/.rrun/cm-*`, so repeated calls cost a few milliseconds.
 
 **`.rrun.conf`** in the project root (optional, bash syntax) pins the project:
 
 ```bash
-host=vps
+host=vps                                      # a name from the config, or "user@host [ssh options]"
 dir=~/agents                                  # default: ~/rrun/<folder name>
 env="UV_PYTHON=3.13 PYTHONUNBUFFERED=1"       # exported before every remote command
 env_filter() { sed 's/^LIVEKIT_URL=.*/LIVEKIT_URL=wss:\/\/prod.example/'; }   # optional
@@ -79,7 +85,7 @@ The project root is the nearest parent with a `.rrun.conf`, else the git top lev
 
 ## What gets synced
 
-Everything in the project root except what git ignores, plus `.git` itself. `.env` and `.env.local` are synced even though they are usually git-ignored. Files deleted locally are deleted on the host.
+Everything in the project root except what git ignores and `.git` itself. `.env` and `.env.local` are synced even though they are usually git-ignored. Files deleted locally are deleted on the host.
 
 **`.rrunignore`** adjusts that, one pattern per line in rsync syntax, `!pattern` re-includes:
 

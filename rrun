@@ -4,7 +4,7 @@
 # so a dropped connection never kills it; the local side reconnects and keeps streaming.
 set -euo pipefail
 
-VERSION=0.1.0
+VERSION=0.1.1
 HOME_CFG="${RRUN_CONFIG:-$HOME/.config/rrun/config}"
 
 say() { printf '\033[1;36m[rrun]\033[0m %s\n' "$*" >&2; }
@@ -30,9 +30,11 @@ rrun [-H host] <command...>     sync the project, run <command> on the remote, s
 Commands are joined and run with `bash -lc` in the remote project dir, so quote pipes:
   rrun 'curl -LsSf https://astral.sh/uv/install.sh | sh'
 
-Config: ~/.config/rrun/config (hosts, default), .rrun.conf in the project root (host, dir, name,
-env, env_filter), .rrunignore (gitignore-like, `!pattern` re-includes). Git-ignored files are
-not synced, except .env and .env.local.
+Hosts: -H takes an ssh target plus ssh options (rrun -H root@vps -p 2222 -i ~/.ssh/k <cmd>), or a
+name from ~/.config/rrun/config, which is a list of `name = target [ssh options]` lines plus
+`default = name`. Project: .rrun.conf in the root (host, dir, name, env, env_filter) and
+.rrunignore (gitignore-like, `!pattern` re-includes). Git-ignored files are not synced, except
+.env and .env.local.
 USAGE
 }
 
@@ -47,15 +49,24 @@ find_root() {
 }
 
 ROOT=$(find_root)
-default="" host="${RRUN_HOST:-}" dir="" name="" env=""
-# shellcheck disable=SC1090
-[ -f "$HOME_CFG" ] && . "$HOME_CFG"
+host="" dir="" name="" env=""
 # shellcheck disable=SC1091
 [ -f "$ROOT/.rrun.conf" ] && . "$ROOT/.rrun.conf"
+cfg() { [ -f "$HOME_CFG" ] || return 0; sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$HOME_CFG" | tail -n 1; }
 
+spec="${RRUN_HOST:-}"
 while [ $# -gt 0 ]; do
     case "$1" in
-        -H|--host) host="$2"; shift 2 ;;
+        -H|--host)
+            spec="$2"; shift 2
+            # ssh options right after the target belong to it: rrun -H root@vps -p 2222 -i ~/.ssh/k <cmd>
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    -p|-i|-o|-J|-l|-F|-c|-m|-b|-D|-L|-R|-w|-W|-e|-I|-S|-B|-E|-P) spec="$spec $1 $2"; shift 2 ;;
+                    -4|-6|-A|-a|-C|-K|-k|-M|-N|-q|-T|-t|-X|-x|-Y|-y|-G|-g) spec="$spec $1"; shift ;;
+                    *) break ;;
+                esac
+            done ;;
         -V|--version) echo "rrun $VERSION"; exit 0 ;;
         -h|--help|help) usage; exit 0 ;;
         --) shift; break ;;
@@ -63,10 +74,14 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-host="${host:-$default}"
-[ -n "$host" ] || die "no host: pass -H <host> or set default= in $HOME_CFG"
-_k="host_${host//[^a-zA-Z0-9_]/_}"; target="${!_k:-$host}"
-_k="ssh_opts_${host//[^a-zA-Z0-9_]/_}"; ssh_extra="${!_k:-}"
+# host spec: -H > RRUN_HOST > .rrun.conf host= > default= in the home config; a first word that
+# names an entry in the home config is replaced by that entry, so `-H vps -p 2222` still works
+[ -n "$spec" ] || spec="$host"
+[ -n "$spec" ] || spec="$(cfg default)"
+[ -n "$spec" ] || die "no host: pass -H <user@host [ssh options]> or set default= in $HOME_CFG"
+first="${spec%% *}"
+if [ -n "$(cfg "$first")" ]; then spec="$(cfg "$first")${spec#"$first"}"; fi
+target="${spec%% *}"; ssh_extra="${spec#"$target"}"
 name="${name:-$(basename "$ROOT")}"
 dir="${dir:-~/rrun/$name}"
 case "$dir" in "$HOME"/*) dir="~${dir#"$HOME"}" ;; esac   # `dir=~/x` in a conf expands locally; undo that
@@ -231,7 +246,7 @@ case "${1:-}" in
     init)        [ -e "$ROOT/.rrun.conf" ] && die ".rrun.conf already exists in $ROOT"
                  cat > "$ROOT/.rrun.conf" <<'TPL'
 # rrun project config (sourced by bash). Every line is optional.
-# host=vps                 # a name from ~/.config/rrun/config, or user@host
+# host=vps                 # a name from ~/.config/rrun/config, or "user@host [ssh options]"
 # dir=~/rrun/<name>        # where the project lives on the host
 # name=<dir basename>      # key for the run state under ~/.rrun/<name> on the host
 # env=""                   # exported before every remote command, e.g. env="UV_PYTHON=3.13"

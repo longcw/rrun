@@ -1,6 +1,5 @@
-# rrun host config, sourced by bash. Copy to ~/.config/rrun/config.
-# A host is a name -> ssh target; `rrun -H <name>` or a project's .rrun.conf picks one,
-# otherwise `default` is used. A name that is not defined here is used as an ssh target as-is.
-default=vps
-host_vps=root@us.long-ch.com
-# ssh_opts_vps="-p 22 -i ~/.ssh/id_ed25519"   # extra ssh options for that host
+# rrun hosts: one `name = ssh-target [ssh options]` per line, and which one is the default.
+# Copy to ~/.config/rrun/config. `rrun -H <name>` picks one; `-H user@host -p 22 -i ~/.ssh/key` needs no config at all.
+vps = root@vps.example.com -p 22 -i ~/.ssh/id_ed25519
+gpu = me@gpu-box
+default = vps
