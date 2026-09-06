@@ -4,7 +4,7 @@
 # so a dropped connection never kills it; the local side reconnects and keeps streaming.
 set -euo pipefail
 
-VERSION=0.6.0
+VERSION=0.6.1
 HOME_CFG="${RRUN_CONFIG:-$HOME/.config/rrun/config}"
 
 say() { printf '\033[1;36m[rrun]\033[0m %s\n' "$*" >&2; }
@@ -343,10 +343,17 @@ pull() {  # paths relative to the project root; never deletes locally
     for p in "$@"; do
         p="${p%/}"
         case "$p" in /*|..|../*|*/..|*/../*) die "pull: $p is outside the project" ;; esac
+        # a filtered file on the host is a transformed copy; never let it replace the local original
+        local f skip=() ex=()
+        for f in ${filt_paths[@]+"${filt_paths[@]}"}; do
+            [ "$f" = "$p" ] && skip=(1)
+            case "$f" in "$p"/*) ex+=(--exclude="/$(basename "$p")/${f#"$p"/}") ;; esac
+        done
+        [ ${#skip[@]} -eq 0 ] || { say "skipping $p: it is filtered on the way up, the remote copy is not the original"; continue; }
         mkdir -p "$ROOT/$(dirname "$p")"
         say "pulling $target:$dir/$p -> $ROOT/$p"
         out=$(mktemp); err=$(mktemp); rc=0
-        rsync -azv -e "ssh $SSH_OPTS" "$target:$dir/$p" "$ROOT/$(dirname "$p")/" >"$out" 2>"$err" || rc=$?
+        rsync -azv -e "ssh $SSH_OPTS" ${ex[@]+"${ex[@]}"} "$target:$dir/$p" "$ROOT/$(dirname "$p")/" >"$out" 2>"$err" || rc=$?
         awk '/\/$/ {next} /^(sent|total|building|Transfer|receiving|sending)/ {next} NF {print "  " $0; n++} END {printf "  %d file(s) pulled\n", n}' "$out" >&2
         [ "$rc" -eq 0 ] || die "pull of $p failed: $(grep -vE '^rsync\(|^[[:space:]]*$' "$err" | head -n 1)"
         rm -f "$out" "$err"
