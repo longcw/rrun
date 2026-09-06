@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# rrun: sync the current project to a remote host, run a command there, stream its logs.
+# The command runs detached on the remote (own process group, log + pid under ~/.rrun/<name>/),
+# so a dropped connection never kills it; the local side reconnects and keeps streaming.
+set -euo pipefail
+
+VERSION=0.1.0
+HOME_CFG="${RRUN_CONFIG:-$HOME/.config/rrun/config}"
+
+say() { printf '\033[1;36m[rrun]\033[0m %s\n' "$*" >&2; }
+die() { printf '\033[1;31m[rrun]\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat <<'USAGE'
+rrun [-H host] <command...>     sync the project, run <command> on the remote, stream its logs
+                                Ctrl-C once stops it (SIGINT) and streams until it has exited; twice kills it
+
+  attach | logs                 re-attach to the running command's logs (last 200 lines, then follow)
+  stop                          SIGINT the command and stream logs until it is down
+  kill                          SIGKILL the command
+  status                        what is running for this project on the host
+  ps                            every rrun-managed run on the host
+  killall                       stop every rrun-managed run on the host (SIGINT, then SIGKILL)
+  sync                          rsync only
+  exec <command...>             run <command> attached with a tty (interactive, not logged)
+  sh                            shell in the remote project dir
+  setup                         install rsync on the host if missing and create the project dir
+  init                          write a .rrun.conf template into the project
+
+Commands are joined and run with `bash -lc` in the remote project dir, so quote pipes:
+  rrun 'curl -LsSf https://astral.sh/uv/install.sh | sh'
+
+Config: ~/.config/rrun/config (hosts, default), .rrun.conf in the project root (host, dir, name,
+env, env_filter), .rrunignore (gitignore-like, `!pattern` re-includes). Git-ignored files are
+not synced, except .env and .env.local.
+USAGE
+}
+
+# ---------------------------------------------------------------- config
+find_root() {
+    local d="$PWD"
+    while [ "$d" != "/" ]; do
+        [ -f "$d/.rrun.conf" ] && { echo "$d"; return; }
+        d=$(dirname "$d")
+    done
+    git rev-parse --show-toplevel 2>/dev/null || pwd
+}
+
+ROOT=$(find_root)
+default="" host="${RRUN_HOST:-}" dir="" name="" env=""
+# shellcheck disable=SC1090
+[ -f "$HOME_CFG" ] && . "$HOME_CFG"
+# shellcheck disable=SC1091
+[ -f "$ROOT/.rrun.conf" ] && . "$ROOT/.rrun.conf"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -H|--host) host="$2"; shift 2 ;;
+        -V|--version) echo "rrun $VERSION"; exit 0 ;;
+        -h|--help|help) usage; exit 0 ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+
+host="${host:-$default}"
+[ -n "$host" ] || die "no host: pass -H <host> or set default= in $HOME_CFG"
+_k="host_${host//[^a-zA-Z0-9_]/_}"; target="${!_k:-$host}"
+_k="ssh_opts_${host//[^a-zA-Z0-9_]/_}"; ssh_extra="${!_k:-}"
+name="${name:-$(basename "$ROOT")}"
+dir="${dir:-~/rrun/$name}"
+case "$dir" in "$HOME"/*) dir="~${dir#"$HOME"}" ;; esac   # `dir=~/x` in a conf expands locally; undo that
+mkdir -p "$HOME/.rrun"
+SSH_OPTS="-o ControlMaster=auto -o ControlPath=~/.rrun/cm-%C -o ControlPersist=10m $ssh_extra"
+# shellcheck disable=SC2206
+SSH=(ssh $SSH_OPTS "$target")
+
+# ---------------------------------------------------------------- remote side
+# These run on the host; they are shipped with `declare -f` in every call, nothing is installed there.
+r_pgid() { local p; p=$(cat "$HOME/.rrun/$1/pid" 2>/dev/null) && kill -0 -- "-$p" 2>/dev/null && echo "$p"; }
+r_stop() { local p; p=$(r_pgid "$1") || return 0; kill "-$2" -- "-$p" 2>/dev/null || true; }
+r_gone() { local i; for i in $(seq "$2"); do r_pgid "$1" >/dev/null || return 0; sleep 0.3; done; return 1; }
+r_start() {  # name dir env command
+    local n=$1 d env=$3 cmd=$4 st="$HOME/.rrun/$1"; eval "d=$2"
+    mkdir -p "$st"
+    r_stop "$n" INT; r_gone "$n" 200 || r_stop "$n" KILL
+    : > "$st/log"; rm -f "$st/exit"; printf '%s\n' "$cmd" > "$st/cmd"
+    cd "$d" 2>/dev/null || { echo "[rrun] remote dir $d is missing; run: rrun setup"; return 1; }
+    [ -n "$env" ] && eval "export $env"
+    # the wrapper stays the group leader; the INT trap keeps it alive to record the exit code
+    setsid bash -c 'st=$1; shift; trap ":" INT; echo $$ > "$st/pid"; bash -lc "$1"; echo $? > "$st/exit"' \
+        _ "$st" "$cmd" >> "$st/log" 2>&1 < /dev/null &
+    local i; for i in $(seq 50); do { r_pgid "$n" >/dev/null || [ -e "$st/exit" ]; } && break; sleep 0.1; done
+}
+r_follow() {  # name from   (from < 0: last 200 lines); exits 0 once the run is over
+    local st="$HOME/.rrun/$1" from=$2 p t total
+    [ -e "$st/log" ] || { echo "[rrun] nothing has been run for $1 on $(hostname)"; return 0; }
+    total=$(wc -l < "$st/log")
+    [ "$from" -lt 0 ] && from=$(( total > 200 ? total - 200 : 0 ))
+    printf '\001rrun:from=%s\n' "$from"
+    if p=$(r_pgid "$1"); then
+        tail -n +$((from + 1)) -f "$st/log" & t=$!
+        while kill -0 -- "-$p" 2>/dev/null; do sleep 0.3; done
+        sleep 0.5; kill "$t" 2>/dev/null; wait "$t" 2>/dev/null || true
+    else
+        tail -n +$((from + 1)) "$st/log"
+    fi
+    if [ -e "$st/exit" ]; then echo "[rrun] exited with code $(cat "$st/exit")"; else echo "[rrun] exited (killed)"; fi
+}
+r_exit() { cat "$HOME/.rrun/$1/exit" 2>/dev/null || echo 137; }
+r_status() {  # name
+    local p
+    if p=$(r_pgid "$1"); then
+        echo "[rrun] running on $(hostname) (pgid $p): $(cat "$HOME/.rrun/$1/cmd")"
+        ps -eo pid,pgid,etime,args | awk -v g="$p" 'NR == 1 || $2 == g' | cut -c1-160
+    else
+        echo "[rrun] nothing running for $1 on $(hostname)"
+    fi
+}
+r_ps() {
+    local d n p
+    for d in "$HOME"/.rrun/*/; do
+        [ -d "$d" ] || { echo "[rrun] no runs on $(hostname)"; return 0; }
+        n=$(basename "$d")
+        if p=$(r_pgid "$n"); then printf '%-24s running  pgid %-8s %s\n' "$n" "$p" "$(cat "$d/cmd")"
+        else printf '%-24s stopped  %s\n' "$n" "$(cat "$d/cmd" 2>/dev/null)"; fi
+    done
+}
+r_killall() {
+    local d n any=""
+    for d in "$HOME"/.rrun/*/; do
+        [ -d "$d" ] || break
+        n=$(basename "$d")
+        r_pgid "$n" >/dev/null && { any=1; echo "[rrun] stopping $n: $(cat "$d/cmd")"; r_stop "$n" INT; }
+    done
+    [ -n "$any" ] || { echo "[rrun] nothing running on $(hostname)"; return 0; }
+    for d in "$HOME"/.rrun/*/; do n=$(basename "$d"); r_gone "$n" 100 || { echo "[rrun] killing $n"; r_stop "$n" KILL; }; done
+    echo "[rrun] all stopped"
+}
+r_setup() {  # dir
+    local d; eval "d=$1"; mkdir -p "$d" "$HOME/.rrun"
+    command -v rsync >/dev/null && { echo "[rrun] $(hostname): rsync present, $d ready"; return 0; }
+    echo "[rrun] installing rsync on $(hostname)"
+    if command -v apt-get >/dev/null; then DEBIAN_FRONTEND=noninteractive apt-get install -y -qq rsync
+    elif command -v dnf >/dev/null; then dnf install -y -q rsync
+    elif command -v yum >/dev/null; then yum install -y -q rsync
+    elif command -v apk >/dev/null; then apk add -q rsync
+    elif command -v pacman >/dev/null; then pacman -S --noconfirm --quiet rsync
+    else echo "[rrun] no known package manager; install rsync by hand"; return 1; fi
+}
+R_LIB=$(declare -f r_pgid r_stop r_gone r_start r_follow r_exit r_status r_ps r_killall r_setup)
+
+remote() {  # run one r_* function on the host; args are re-quoted so spaces survive
+    "${SSH[@]}" bash -s <<REMOTE
+$R_LIB
+$(printf '%q ' "$@")
+REMOTE
+}
+
+# ---------------------------------------------------------------- local side
+sync() {
+    say "syncing $ROOT -> $target:$dir"
+    local ex; ex=$(mktemp); local inc=() exc=() l
+    if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        # everything git ignores stays local, except env files
+        git -C "$ROOT" ls-files -o -i --exclude-standard --directory | grep -vE '(^|/)\.env(\.local)?$' | sed 's|^|/|' > "$ex" || true
+        echo "/.git" >> "$ex"
+    fi
+    if [ -f "$ROOT/.rrunignore" ]; then
+        while IFS= read -r l; do
+            case "$l" in ''|'#'*) ;; '!'*) inc+=(--include="${l#!}") ;; *) exc+=(--exclude="$l") ;; esac
+        done < "$ROOT/.rrunignore"
+    fi
+    type env_filter >/dev/null 2>&1 && exc+=(--exclude=/.env)
+    rsync -az --delete -v -e "ssh $SSH_OPTS" --rsync-path="mkdir -p $dir && rsync" ${inc[@]+"${inc[@]}"} ${exc[@]+"${exc[@]}"} --exclude-from="$ex" \
+        "$ROOT/" "$target:$dir/" \
+        | awk '/\/$/ {next} /^(sent|total|building|Transfer|deleting|receiving|sending)/ {next} NF {print "  " $0; n++} END {printf "  %d file(s) changed\n", n}' >&2
+    rm -f "$ex"
+    if type env_filter >/dev/null 2>&1 && [ -f "$ROOT/.env" ]; then
+        env_filter < "$ROOT/.env" | "${SSH[@]}" "cat > $dir/.env"
+        say "synced (.env through env_filter)"
+    else
+        say "synced"
+    fi
+}
+
+# stream the remote log from line $1 until the run is over; survives Ctrl-C and dropped connections
+follow() {
+    local from=$1 hits=0 cnt pid rc
+    cnt=$(mktemp)
+    trap 'hits=$((hits + 1)); if [ $hits -eq 1 ]; then say "stopping $name (Ctrl-C again to kill)"; remote r_stop "$name" INT; else say "killing $name"; remote r_stop "$name" KILL; fi' INT
+    while :; do
+        # the reader ignores SIGINT so the terminal's Ctrl-C reaches only the trap above;
+        # it keeps the count of lines shown so a reconnect resumes where the stream broke
+        ( trap '' INT
+          remote r_follow "$name" "$from" | awk -v f="$cnt" '
+              !seen { seen = 1; if (index($0, "\001rrun:from=") == 1) { base = substr($0, 12) + 0; next } }
+              { print; fflush(); n++; printf "%d\n", base + n > f; close(f) }'
+          exit "${PIPESTATUS[0]}" ) & pid=$!
+        while :; do wait "$pid" && rc=0 || rc=$?; kill -0 "$pid" 2>/dev/null || break; done
+        [ "$rc" -eq 0 ] && break
+        from=$(cat "$cnt" 2>/dev/null || echo "$from")
+        if remote r_pgid "$name" >/dev/null 2>&1; then say "connection lost, reconnecting"; sleep 1
+        elif [ $? -eq 255 ]; then say "$target unreachable, retrying in 3s"; sleep 3
+        fi
+    done
+    rm -f "$cnt"; trap - INT
+}
+
+run() {
+    [ $# -gt 0 ] || { usage; exit 1; }
+    sync
+    say "starting on $target: $*"
+    remote r_start "$name" "$dir" "$env" "$*"
+    follow 0
+    exit "$(remote r_exit "$name")"
+}
+
+case "${1:-}" in
+    sync)        sync ;;
+    setup)       remote r_setup "$dir"; sync ;;
+    attach|logs) follow -1 ;;
+    stop)        remote r_stop "$name" INT; follow -1 ;;
+    kill)        remote r_stop "$name" KILL; say "killed $name" ;;
+    status)      remote r_status "$name" ;;
+    ps)          remote r_ps ;;
+    killall)     remote r_killall ;;
+    exec)        shift; [ $# -gt 0 ] || die "exec: no command"
+                 "${SSH[@]}" -t "cd $dir && ${env:+export $env &&} bash -lc $(printf '%q' "$*")" ;;
+    sh|shell)    "${SSH[@]}" -t "cd $dir && exec bash -l" ;;
+    init)        [ -e "$ROOT/.rrun.conf" ] && die ".rrun.conf already exists in $ROOT"
+                 cat > "$ROOT/.rrun.conf" <<'TPL'
+# rrun project config (sourced by bash). Every line is optional.
+# host=vps                 # a name from ~/.config/rrun/config, or user@host
+# dir=~/rrun/<name>        # where the project lives on the host
+# name=<dir basename>      # key for the run state under ~/.rrun/<name> on the host
+# env=""                   # exported before every remote command, e.g. env="UV_PYTHON=3.13"
+# env_filter() { cat; }    # if defined, .env is piped through it on the way to the host
+TPL
+                 say "wrote $ROOT/.rrun.conf" ;;
+    run)         shift; [ "${1:-}" = "--" ] && shift; run "$@" ;;
+    "")          usage; exit 1 ;;
+    *)           run "$@" ;;
+esac
