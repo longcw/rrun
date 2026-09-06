@@ -4,7 +4,7 @@
 # so a dropped connection never kills it; the local side reconnects and keeps streaming.
 set -euo pipefail
 
-VERSION=0.5.2
+VERSION=0.6.0
 HOME_CFG="${RRUN_CONFIG:-$HOME/.config/rrun/config}"
 
 say() { printf '\033[1;36m[rrun]\033[0m %s\n' "$*" >&2; }
@@ -28,6 +28,7 @@ subcommand below acts on the default run unless a run name is given.
   clean [run]                   remove the project's run state on the host (stops it first); or one run
   killall                       stop every rrun-managed run on the host (SIGINT, then SIGKILL)
   sync                          rsync only
+  pull <path...>                fetch files or folders from the remote project dir back into this one
   exec <command...>             run <command> attached with a tty (interactive, not logged)
   sh                            shell in the remote project dir
   setup                         install rsync on the host if missing and create the project dir
@@ -335,6 +336,23 @@ sync() {
     say "synced"
 }
 
+pull() {  # paths relative to the project root; never deletes locally
+    [ $# -gt 0 ] || die "pull: give one or more paths relative to the project root, e.g. rrun pull out/ results.json"
+    check_host
+    local p out err rc
+    for p in "$@"; do
+        p="${p%/}"
+        case "$p" in /*|..|../*|*/..|*/../*) die "pull: $p is outside the project" ;; esac
+        mkdir -p "$ROOT/$(dirname "$p")"
+        say "pulling $target:$dir/$p -> $ROOT/$p"
+        out=$(mktemp); err=$(mktemp); rc=0
+        rsync -azv -e "ssh $SSH_OPTS" "$target:$dir/$p" "$ROOT/$(dirname "$p")/" >"$out" 2>"$err" || rc=$?
+        awk '/\/$/ {next} /^(sent|total|building|Transfer|receiving|sending)/ {next} NF {print "  " $0; n++} END {printf "  %d file(s) pulled\n", n}' "$out" >&2
+        [ "$rc" -eq 0 ] || die "pull of $p failed: $(grep -vE '^rsync\(|^[[:space:]]*$' "$err" | head -n 1)"
+        rm -f "$out" "$err"
+    done
+}
+
 # stream the remote log from $1 (gen:lines, or -1 for the tail) until the run is over; survives Ctrl-C and dropped connections
 follow() {
     local from=$1 hits=0 cnt pid rc
@@ -371,6 +389,7 @@ pick() { [ -n "${1:-}" ] && { run="$1"; key="$name/$1"; label="$(r_label "$key")
 
 case "${1:-}" in
     sync)        sync ;;
+    pull)        shift; pull "$@" ;;
     setup)       remote r_setup "$dir"; sync ;;
     attach|logs) pick "${2:-}"; follow -1 ;;
     stop)        pick "${2:-}"; remote r_stop "$key" INT; follow -1 ;;

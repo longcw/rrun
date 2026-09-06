@@ -43,6 +43,7 @@ or `git clone https://github.com/longcw/rrun && rrun/install.sh`. `rrun update` 
 | `rrun clean [run]` | remove the project's run state on the host, stopping anything still running; or one run |
 | `rrun killall` | stop every rrun-managed run on the host (SIGINT, then SIGKILL after 30 s) |
 | `rrun sync` | rsync only |
+| `rrun pull <path...>` | fetch files or folders from the remote project dir back into this one; never deletes locally |
 | `rrun exec <command...>` | run attached with a tty: interactive things, installers that prompt, `htop` |
 | `rrun sh` | a shell in the remote project dir |
 | `rrun setup` | install rsync on the host if missing, create the project dir, sync |
