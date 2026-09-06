@@ -9,7 +9,8 @@ $ rrun uv run python examples/voice_agents/basic_agent.py dev
 [rrun] syncing /Users/me/code/agents -> root@vps:~/agents
   livekit-agents/livekit/agents/voice/agent_session.py
   1 file(s) changed
-[rrun] synced (.env through env_filter)
+[rrun]   .env (filtered)
+[rrun] synced
 [rrun] starting on root@vps: uv run python examples/voice_agents/basic_agent.py dev
 2026-09-06 07:30:31 - INFO livekit.agents - registered worker {...}
 ^C[rrun] stopping agents (Ctrl-C again to kill)
@@ -80,12 +81,14 @@ Then `rrun -H gpu ...`, or just `rrun ...` for the default. `root` is the parent
 host=vps                                      # a name from the config, or "user@host [ssh options]"
 dir=~/agents                                  # default: <root>/<folder name>; `rrun -d ~/agents ...` writes this line
 env="UV_PYTHON=3.13 PYTHONUNBUFFERED=1"       # exported before every remote command
-env_filter() { sed 's/^LIVEKIT_URL=.*/LIVEKIT_URL=wss:\/\/prod.example/'; }   # optional
+filter .env "sed 's/^API_URL=.*/API_URL=https:\/\/prod.example/'"
+filter config.yaml to_prod                     # any command, or a function defined in this file
+to_prod() { sed 's/localhost/0.0.0.0/'; }
 ```
 
 The project root is the nearest parent with a `.rrun.conf`, else the git top level, else the current directory. Its basename is the project `name`, which keys the run state on the host under `~/.rrun/<name>/` (`log`, `pid`, `cmd`, `exit`).
 
-`env_filter`, if defined, receives the local `.env` on stdin and its output is written as the remote `.env`. Use it when the same checkout should point at a different backend from the host.
+A `filter <file> <command>` line takes that file out of rsync; instead the local file is piped through the command and the output is written to the same path on the host. Use it when the same checkout should point at a different backend from the host, for example to activate a different block of `.env`. Repeat the line for more files.
 
 ## What gets synced
 

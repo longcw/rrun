@@ -4,7 +4,7 @@
 # so a dropped connection never kills it; the local side reconnects and keeps streaming.
 set -euo pipefail
 
-VERSION=0.1.4
+VERSION=0.1.5
 HOME_CFG="${RRUN_CONFIG:-$HOME/.config/rrun/config}"
 
 say() { printf '\033[1;36m[rrun]\033[0m %s\n' "$*" >&2; }
@@ -36,7 +36,7 @@ Commands are joined and run with `bash -lc` in the remote project dir, so quote 
 
 Hosts: -H takes an ssh target plus ssh options (rrun -H root@vps -p 2222 -i ~/.ssh/k <cmd>), or a
 name from ~/.config/rrun/config, which is a list of `name = target [ssh options]` lines plus
-`default = name` and optionally `root = <parent folder for all projects on the host>`. Project: .rrun.conf in the root (host, dir, name, env, env_filter) and
+`default = name` and optionally `root = <parent folder for all projects on the host>`. Project: .rrun.conf in the root (host, dir, name, env, filter lines) and
 .rrunignore (gitignore-like, `!pattern` re-includes). Git-ignored files are not synced, except
 .env and .env.local.
 USAGE
@@ -53,7 +53,10 @@ find_root() {
 }
 
 ROOT=$(find_root)
-host="" dir="" name="" env=""
+host="" dir="" name="" env="" filt_paths=() filt_cmds=()
+# `filter <file> <command>` in .rrun.conf: the file is not rsynced; it is piped through the command
+# (a function from the conf or any shell command) and the output written to the same path on the host
+filter() { filt_paths+=("$1"); filt_cmds+=("$2"); }
 # shellcheck disable=SC1091
 [ -f "$ROOT/.rrun.conf" ] && . "$ROOT/.rrun.conf"
 cfg() { [ -f "$HOME_CFG" ] || return 0; sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$HOME_CFG" | tail -n 1; }
@@ -204,17 +207,21 @@ sync() {
             case "$l" in ''|'#'*) ;; '!'*) inc+=(--include="${l#!}") ;; *) exc+=(--exclude="$l") ;; esac
         done < "$ROOT/.rrunignore"
     fi
-    type env_filter >/dev/null 2>&1 && exc+=(--exclude=/.env)
+    local i=0 f
+    for f in ${filt_paths[@]+"${filt_paths[@]}"}; do exc+=(--exclude="/$f"); done
     rsync -az --delete -v -e "ssh $SSH_OPTS" --rsync-path="mkdir -p $dir && rsync" ${inc[@]+"${inc[@]}"} ${exc[@]+"${exc[@]}"} --exclude-from="$ex" \
         "$ROOT/" "$target:$dir/" \
         | awk '/\/$/ {next} /^(sent|total|building|Transfer|deleting|receiving|sending)/ {next} NF {print "  " $0; n++} END {printf "  %d file(s) changed\n", n}' >&2
     rm -f "$ex"
-    if type env_filter >/dev/null 2>&1 && [ -f "$ROOT/.env" ]; then
-        env_filter < "$ROOT/.env" | "${SSH[@]}" "cat > $dir/.env"
-        say "synced (.env through env_filter)"
-    else
-        say "synced"
-    fi
+    while [ "$i" -lt "${#filt_paths[@]}" ]; do
+        f="${filt_paths[$i]}"
+        if [ -f "$ROOT/$f" ]; then
+            eval "${filt_cmds[$i]}" < "$ROOT/$f" | "${SSH[@]}" "mkdir -p $dir/$(dirname "$f") && cat > $dir/$f"
+            say "  $f (filtered)"
+        fi
+        i=$((i + 1))
+    done
+    say "synced"
 }
 
 # stream the remote log from line $1 until the run is over; survives Ctrl-C and dropped connections
@@ -268,7 +275,9 @@ case "${1:-}" in
 # dir=~/rrun/<name>        # where the project lives on the host (`rrun -d <dir>` writes this line)
 # name=<dir basename>      # key for the run state under ~/.rrun/<name> on the host
 # env=""                   # exported before every remote command, e.g. env="UV_PYTHON=3.13"
-# env_filter() { cat; }    # if defined, .env is piped through it on the way to the host
+# filter .env "sed 's/^API_URL=.*/API_URL=https:\/\/prod.example/'"
+#                          # a file is not rsynced but piped through a command (or a function defined
+#                          # here) and the output written to the same path on the host; repeatable
 TPL
                  say "wrote $ROOT/.rrun.conf" ;;
     update)      i=$(curl -fsSL https://raw.githubusercontent.com/longcw/rrun/main/install.sh) || die "could not fetch install.sh"
