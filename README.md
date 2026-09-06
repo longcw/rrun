@@ -47,6 +47,7 @@ or `git clone https://github.com/longcw/rrun && rrun/install.sh`. `rrun update` 
 | `rrun sh` | a shell in the remote project dir |
 | `rrun setup` | install rsync on the host if missing, create the project dir, sync |
 | `rrun init` | write a commented `.rrun.conf` template |
+| `rrun -y ...` | skip the first-sync confirmation |
 | `rrun -H <host> ...` | use another host for this invocation |
 | `rrun -d <dir> ...` | use this remote folder for the project and remember it in `.rrun.conf` |
 
@@ -100,6 +101,8 @@ Logs rotate: when a run's log passes `log_max` (default 50M, settable in the con
 A `filter <file> <command>` line takes that file out of rsync; instead the local file is piped through the command and the output is written to the same path on the host. Use it when the same checkout should point at a different backend from the host, for example to activate a different block of `.env`. Repeat the line for more files.
 
 ## What gets synced
+
+The first time you run rrun in a folder that has no `.rrun.conf`, it shows the folder, the file count, and the destination, and asks before uploading anything, so a stray `rrun` in your home directory does not mirror it to the host. Confirming writes a `.rrun.conf`, which marks the folder as a project; later runs sync without asking. `-y` answers yes, and a non-interactive run without `-y` refuses instead of prompting. `rrun exec` never syncs, so it needs no project at all.
 
 Everything in the project root except what git ignores and `.git` itself. `.env` and `.env.local` are synced even though they are usually git-ignored. Files deleted locally are deleted on the host.
 

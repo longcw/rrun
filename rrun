@@ -4,7 +4,7 @@
 # so a dropped connection never kills it; the local side reconnects and keeps streaming.
 set -euo pipefail
 
-VERSION=0.4.1
+VERSION=0.5.0
 HOME_CFG="${RRUN_CONFIG:-$HOME/.config/rrun/config}"
 
 say() { printf '\033[1;36m[rrun]\033[0m %s\n' "$*" >&2; }
@@ -12,7 +12,7 @@ die() { printf '\033[1;31m[rrun]\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
     cat <<'USAGE'
-rrun [-H host] [-d dir] [-n run | -N] <command...>
+rrun [-H host] [-d dir] [-n run | -N] [-y] <command...>
                                 sync the project, run <command> on the remote, stream its logs
                                 Ctrl-C once stops it (SIGINT) and streams until it has exited; twice kills it
 
@@ -32,9 +32,13 @@ subcommand below acts on the default run unless a run name is given.
   sh                            shell in the remote project dir
   setup                         install rsync on the host if missing and create the project dir
   init                          write a .rrun.conf template into the project
+  -y                            skip the first-sync confirmation for a folder that has no .rrun.conf
   update                        reinstall the latest rrun from GitHub
   -d <dir>                      remote folder for this project; saved to .rrun.conf for next time
                                 (default: <root>/<folder name>, root = ~/rrun or `root = ...` in the config)
+
+The first sync from a folder without a .rrun.conf shows what would be uploaded and asks first;
+confirming writes the .rrun.conf. `rrun exec` never syncs.
 
 Commands are joined and run with `bash -lc` in the remote project dir, so quote pipes:
   rrun 'curl -LsSf https://astral.sh/uv/install.sh | sh'
@@ -67,10 +71,11 @@ filter() { filt_paths+=("$1"); filt_cmds+=("$2"); }
 [ -f "$ROOT/.rrun.conf" ] && . "$ROOT/.rrun.conf"
 cfg() { [ -f "$HOME_CFG" ] || return 0; sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$HOME_CFG" | tail -n 1; }
 
-spec="${RRUN_HOST:-}" dir_arg="" run=""
+spec="${RRUN_HOST:-}" dir_arg="" run="" yes=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -d|--dir) dir_arg="$2"; shift 2 ;;
+        -y|--yes) yes=1; shift ;;
         -n|--name) run="$2"; shift 2 ;;
         -N|--new) run="run-$(od -An -tx1 -N2 /dev/urandom | tr -d ' \n')"; shift ;;
         -H|--host)
@@ -256,9 +261,22 @@ REMOTE
 # ---------------------------------------------------------------- local side
 label="$(r_label "$key")"
 
+write_conf() {
+    cat >> "$ROOT/.rrun.conf" <<'TPL'
+# rrun project config (sourced by bash). Every line is optional; the file marks this folder as a project.
+# host=vps                 # a name from ~/.config/rrun/config, or "user@host [ssh options]"
+# dir=~/rrun/<name>        # where the project lives on the host (`rrun -d <dir>` writes this line)
+# name=<dir basename>      # key for the run state under ~/.rrun/<name> on the host
+# env=""                   # exported before every remote command, e.g. env="UV_PYTHON=3.13"
+# log_max=50M              # rotate the run log past this size (one previous copy kept as log.1); 0 = never
+# filter .env "sed 's/^API_URL=.*/API_URL=https:\/\/prod.example/'"
+#                          # a file is not rsynced but piped through a command (or a function defined
+#                          # here) and the output written to the same path on the host; repeatable
+TPL
+}
+
 sync() {
     check_host
-    say "syncing $ROOT -> $target:$dir"
     local ex; ex=$(mktemp); local err; err=$(mktemp); local inc=() exc=() l
     if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         # everything git ignores stays local, except env files
@@ -272,8 +290,22 @@ sync() {
     fi
     local i=0 f
     for f in ${filt_paths[@]+"${filt_paths[@]}"}; do exc+=(--exclude="/$f"); done
-    rsync -az --delete -v -e "ssh $SSH_OPTS" --rsync-path="mkdir -p $dir && rsync" ${inc[@]+"${inc[@]}"} ${exc[@]+"${exc[@]}"} --exclude-from="$ex" \
-        "$ROOT/" "$target:$dir/" 2>"$err" \
+    set -- -az --delete -e "ssh $SSH_OPTS" --rsync-path="mkdir -p $dir && rsync" \
+        ${inc[@]+"${inc[@]}"} ${exc[@]+"${exc[@]}"} --exclude-from="$ex" "$ROOT/" "$target:$dir/"
+    # a folder without .rrun.conf has never been synced from: show what would go up and ask first
+    if [ ! -f "$ROOT/.rrun.conf" ]; then
+        local n sz; n=$(rsync -n --stats "$@" 2>/dev/null | awk -F': ' '/Number of files/ {n=$2} /Total file size/ {printf "%s files, %s", n, $2}')
+        say "first sync from $ROOT (no .rrun.conf here): ${n:-? files} -> $target:$dir"
+        [ "$ROOT" != "$HOME" ] || say "this is your home directory"
+        if [ -z "$yes" ]; then
+            [ -t 0 ] || die "not syncing without confirmation: run interactively, pass -y, or create .rrun.conf (rrun init)"
+            printf '\033[1;36m[rrun]\033[0m sync it? [y/N] ' >&2; read -r l </dev/tty
+            case "$l" in y|Y|yes) ;; *) die "not synced. \`rrun exec <cmd>\` runs on the host without syncing; \`rrun -d <dir>\` picks the remote folder" ;; esac
+        fi
+        write_conf; say "wrote $ROOT/.rrun.conf; this folder is now an rrun project"
+    fi
+    say "syncing $ROOT -> $target:$dir"
+    rsync -v "$@" 2>"$err" \
         | awk '/\/$/ {next} /^(sent|total|building|Transfer|deleting|receiving|sending)/ {next} NF {print "  " $0; n++} END {printf "  %d file(s) changed\n", n}' >&2 \
         || die "rsync to $target:$dir failed: $(grep -vE '^rsync\(|^[[:space:]]*$' "$err" | head -n 1) (no rsync on the host? try: rrun setup)"
     rm -f "$ex" "$err"
@@ -333,23 +365,9 @@ case "${1:-}" in
     clean)       if [ -n "${2:-}" ]; then remote r_clean "$name/$2"; else remote r_clean "$name"; fi ;;
     killall)     remote r_killall ;;
     exec)        shift; [ $# -gt 0 ] || die "exec: no command"; check_host
-                 "${SSH[@]}" -t "cd $dir && ${env:+export $env &&} bash -lc $(printf '%q' "$*")" ;;
+                 "${SSH[@]}" -t "cd $dir 2>/dev/null || cd; ${env:+export $env;} bash -lc $(printf '%q' "$*")" ;;
     sh|shell)    check_host; "${SSH[@]}" -t "cd $dir && exec bash -l" ;;
-    init)        [ -e "$ROOT/.rrun.conf" ] && die ".rrun.conf already exists in $ROOT"
-                 cat > "$ROOT/.rrun.conf" <<'TPL'
-# rrun project config (sourced by bash). Every line is optional.
-# host=vps                 # a name from ~/.config/rrun/config, or "user@host [ssh options]"
-# dir=~/rrun/<name>        # where the project lives on the host (`rrun -d <dir>` writes this line)
-# name=<dir basename>      # key for the run state under ~/.rrun/<name> on the host
-# env=""                   # exported before every remote command, e.g. env="UV_PYTHON=3.13"
-# log_max=50M              # rotate the run log past this size (one previous copy kept as log.1); 0 = never
-# filter .env "sed 's/^API_URL=.*/API_URL=https:\/\/prod.example/'"
-#                          # a file is not rsynced but piped through a command (or a function defined
-#                          # here) and the output written to the same path on the host; repeatable
-TPL
-                 say "wrote $ROOT/.rrun.conf" ;;
-    update)      i=$(curl -fsSL https://raw.githubusercontent.com/longcw/rrun/main/install.sh) || die "could not fetch install.sh"
-                 RRUN_BIN="$(cd "$(dirname "$0")" && pwd)" bash -c "$i" ;;
+    init)        [ -e "$ROOT/.rrun.conf" ] && die ".rrun.conf already exists in $ROOT"; write_conf; say "wrote $ROOT/.rrun.conf" ;;
     run)         shift; [ "${1:-}" = "--" ] && shift; run "$@" ;;
     "")          usage; exit 1 ;;
     *)           run "$@" ;;
