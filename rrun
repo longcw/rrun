@@ -4,7 +4,7 @@
 # so a dropped connection never kills it; the local side reconnects and keeps streaming.
 set -euo pipefail
 
-VERSION=0.2.1
+VERSION=0.3.0
 HOME_CFG="${RRUN_CONFIG:-$HOME/.config/rrun/config}"
 
 say() { printf '\033[1;36m[rrun]\033[0m %s\n' "$*" >&2; }
@@ -16,15 +16,16 @@ rrun [-H host] [-d dir] [-n run | -N] <command...>
                                 sync the project, run <command> on the remote, stream its logs
                                 Ctrl-C once stops it (SIGINT) and streams until it has exited; twice kills it
 
-Runs are named <project>/<run>. Without -n the run is "main" and starting it replaces the previous
-"main"; -n <run> uses another slot, -N starts a fresh run with a generated name. Several runs of one
-project share the synced folder and can run at the same time.
+A project has a default run, shown as <project>, and starting it replaces the previous one. -n <run>
+uses another slot, shown as <project>:<run>, that runs alongside; -N picks a generated name. Every
+subcommand below acts on the default run unless a run name is given.
 
   attach | logs [run]           re-attach to a run's logs (last 200 lines, then follow)
   stop [run]                    SIGINT the run and stream logs until it is down
   kill [run]                    SIGKILL the run
-  status [run]                  runs of this project on the host, or one run in detail
-  ps                            every rrun-managed run on the host
+  status [run]                  is the run alive, its processes or exit code
+  ps [-a]                       this project's runs on the host; -a: every project
+  clean [run]                   remove the project's run state on the host (stops it first); or one run
   killall                       stop every rrun-managed run on the host (SIGINT, then SIGKILL)
   sync                          rsync only
   exec <command...>             run <command> attached with a tty (interactive, not logged)
@@ -99,7 +100,7 @@ elif [ -f "$HOME_CFG" ]; then case "$first" in *@*|*.*|*:*) ;; *) say "'$first' 
 fi
 target="${spec%% *}"; ssh_extra="${spec#"$target"}"
 name="${name:-$(basename "$ROOT")}"
-key="$name/${run:-main}"   # a run's state lives at ~/.rrun/<project>/<run>/ on the host
+run="${run:-default}"; key="$name/$run"   # state lives at ~/.rrun/<project>/<run>/ on the host
 if [ -n "$dir_arg" ]; then
     dir="$dir_arg"
     case "$dir" in "$HOME"/*) dir="~${dir#"$HOME"}" ;; esac   # `~/x` was expanded by the local shell
@@ -122,6 +123,7 @@ SSH=(ssh $SSH_OPTS "$target")
 
 # ---------------------------------------------------------------- remote side
 # These run on the host; they are shipped with `declare -f` in every call, nothing is installed there.
+r_label() { case "$1" in */default) echo "${1%/default}" ;; *) echo "${1%/*}:${1##*/}" ;; esac; }
 r_pgid() { local p; p=$(cat "$HOME/.rrun/$1/pid" 2>/dev/null) && kill -0 -- "-$p" 2>/dev/null && echo "$p"; }
 r_stop() { local p; p=$(r_pgid "$1") || return 0; kill "-$2" -- "-$p" 2>/dev/null || true; }
 r_gone() { local i; for i in $(seq "$2"); do r_pgid "$1" >/dev/null || return 0; sleep 0.3; done; return 1; }
@@ -145,7 +147,7 @@ r_start() {  # name dir env command
 }
 r_follow() {  # name from   (from < 0: last 200 lines); exits 0 once the run is over
     local st="$HOME/.rrun/$1" from=$2 p t total
-    [ -e "$st/log" ] || { echo "[rrun] no run $1 on $(hostname)"; return 0; }
+    [ -e "$st/log" ] || { echo "[rrun] no run $(r_label "$1") on $(hostname)"; return 0; }
     total=$(wc -l < "$st/log")
     [ "$from" -lt 0 ] && from=$(( total > 200 ? total - 200 : 0 ))
     printf '\001rrun:from=%s\n' "$from"
@@ -156,17 +158,17 @@ r_follow() {  # name from   (from < 0: last 200 lines); exits 0 once the run is 
     else
         tail -n +$((from + 1)) "$st/log"
     fi
-    if [ -e "$st/exit" ]; then echo "[rrun] $1 exited with code $(cat "$st/exit")"; else echo "[rrun] $1 exited (killed)"; fi
+    if [ -e "$st/exit" ]; then echo "[rrun] $(r_label "$1") exited with code $(cat "$st/exit")"; else echo "[rrun] $(r_label "$1") exited (killed)"; fi
 }
 r_exit() { cat "$HOME/.rrun/$1/exit" 2>/dev/null || echo 137; }
 r_status() {  # key
     local p st="$HOME/.rrun/$1"
-    [ -e "$st/cmd" ] || { echo "[rrun] no run $1 on $(hostname)"; return 0; }
+    [ -e "$st/cmd" ] || { echo "[rrun] no run $(r_label "$1") on $(hostname)"; return 0; }
     if p=$(r_pgid "$1"); then
-        echo "[rrun] $1 running on $(hostname), pgid $p: $(cat "$st/cmd")"
+        echo "[rrun] $(r_label "$1") running on $(hostname), pgid $p: $(cat "$st/cmd")"
         ps -eo pid,pgid,etime,args | awk -v g="$p" 'NR == 1 || $2 == g' | cut -c1-160
     else
-        echo "[rrun] $1 stopped on $(hostname), exit $(cat "$st/exit" 2>/dev/null || echo killed): $(cat "$st/cmd")"
+        echo "[rrun] $(r_label "$1") stopped on $(hostname), exit $(cat "$st/exit" 2>/dev/null || echo killed): $(cat "$st/cmd")"
     fi
 }
 r_ps() {  # [project]   one line per run, all projects unless one is given
@@ -175,8 +177,8 @@ r_ps() {  # [project]   one line per run, all projects unless one is given
         [ -e "$d/cmd" ] || continue
         [ -n "$any" ] || { any=1; printf '%-30s %-8s %-11s %s\n' RUN STATE PGID/EXIT COMMAND; }
         k=${d%/}; k=${k#"$HOME"/.rrun/}
-        if p=$(r_pgid "$k"); then printf '%-30s %-8s %-11s %s\n' "$k" running "$p" "$(cat "$d/cmd")"
-        else printf '%-30s %-8s %-11s %s\n' "$k" stopped "exit $(cat "$d/exit" 2>/dev/null || echo killed)" "$(cat "$d/cmd")"; fi
+        if p=$(r_pgid "$k"); then printf '%-30s %-8s %-11s %s\n' "$(r_label "$k")" running "$p" "$(cat "$d/cmd")"
+        else printf '%-30s %-8s %-11s %s\n' "$(r_label "$k")" stopped "exit $(cat "$d/exit" 2>/dev/null || echo killed)" "$(cat "$d/cmd")"; fi
     done
     [ -n "$any" ] || echo "[rrun] no runs${1:+ of $1} on $(hostname)"
 }
@@ -185,15 +187,25 @@ r_killall() {
     for d in "$HOME"/.rrun/*/*/; do
         [ -e "$d/cmd" ] || continue
         k=${d%/}; k=${k#"$HOME"/.rrun/}
-        r_pgid "$k" >/dev/null && { any=1; echo "[rrun] stopping $k: $(cat "$d/cmd")"; r_stop "$k" INT; }
+        r_pgid "$k" >/dev/null && { any=1; echo "[rrun] stopping $(r_label "$k"): $(cat "$d/cmd")"; r_stop "$k" INT; }
     done
     [ -n "$any" ] || { echo "[rrun] nothing running on $(hostname)"; return 0; }
     for d in "$HOME"/.rrun/*/*/; do
         [ -e "$d/cmd" ] || continue
         k=${d%/}; k=${k#"$HOME"/.rrun/}
-        r_gone "$k" 100 || { echo "[rrun] killing $k"; r_stop "$k" KILL; }
+        r_gone "$k" 100 || { echo "[rrun] killing $(r_label "$k")"; r_stop "$k" KILL; }
     done
     echo "[rrun] all stopped"
+}
+r_clean() {  # project or project/run: stop whatever is running there, then remove the state
+    local d k any=""
+    for d in "$HOME"/.rrun/$1/*/ "$HOME"/.rrun/$1/; do
+        [ -e "$d/cmd" ] || continue
+        any=1; k=${d%/}; k=${k#"$HOME"/.rrun/}
+        r_pgid "$k" >/dev/null && { echo "[rrun] stopping $(r_label "$k")"; r_stop "$k" INT; r_gone "$k" 100 || r_stop "$k" KILL; }
+    done
+    [ -n "$any" ] || [ -d "$HOME/.rrun/$1" ] || { echo "[rrun] no state for $1 on $(hostname)"; return 0; }
+    rm -rf "$HOME/.rrun/$1"; echo "[rrun] removed ~/.rrun/$1 on $(hostname)"
 }
 r_setup() {  # dir
     local d; eval "d=$1"; mkdir -p "$d" "$HOME/.rrun"
@@ -206,7 +218,7 @@ r_setup() {  # dir
     elif command -v pacman >/dev/null; then pacman -S --noconfirm --quiet rsync
     else echo "[rrun] no known package manager; install rsync by hand"; return 1; fi
 }
-R_LIB=$(declare -f r_pgid r_stop r_gone r_start r_follow r_exit r_status r_ps r_killall r_setup)
+R_LIB=$(declare -f r_label r_pgid r_stop r_gone r_start r_follow r_exit r_status r_ps r_killall r_clean r_setup)
 
 remote() {  # run one r_* function on the host; args are re-quoted so spaces survive
     "${SSH[@]}" bash -s <<REMOTE
@@ -216,6 +228,8 @@ REMOTE
 }
 
 # ---------------------------------------------------------------- local side
+label="$(r_label "$key")"
+
 sync() {
     say "syncing $ROOT -> $target:$dir"
     local ex; ex=$(mktemp); local inc=() exc=() l
@@ -250,7 +264,7 @@ sync() {
 follow() {
     local from=$1 hits=0 cnt pid rc
     cnt=$(mktemp)
-    trap 'hits=$((hits + 1)); if [ $hits -eq 1 ]; then say "stopping $key (Ctrl-C again to kill)"; remote r_stop "$key" INT; else say "killing $key"; remote r_stop "$key" KILL; fi' INT
+    trap 'hits=$((hits + 1)); if [ $hits -eq 1 ]; then say "stopping $label (Ctrl-C again to kill)"; remote r_stop "$key" INT; else say "killing $label"; remote r_stop "$key" KILL; fi' INT
     while :; do
         # the reader ignores SIGINT so the terminal's Ctrl-C reaches only the trap above;
         # it keeps the count of lines shown so a reconnect resumes where the stream broke
@@ -272,22 +286,23 @@ follow() {
 run() {
     [ $# -gt 0 ] || { usage; exit 1; }
     sync
-    say "starting $key on $target: $*"
+    say "starting $label on $target: $*"
     remote r_start "$key" "$dir" "$env" "$*"
     follow 0
     exit "$(remote r_exit "$key")"
 }
 # subcommands that take a run name positionally, docker style: rrun attach load
-pick() { [ -n "${1:-}" ] && key="$name/$1" || true; }
+pick() { [ -n "${1:-}" ] && { run="$1"; key="$name/$1"; label="$(r_label "$key")"; } || true; }
 
 case "${1:-}" in
     sync)        sync ;;
     setup)       remote r_setup "$dir"; sync ;;
     attach|logs) pick "${2:-}"; follow -1 ;;
     stop)        pick "${2:-}"; remote r_stop "$key" INT; follow -1 ;;
-    kill)        pick "${2:-}"; remote r_stop "$key" KILL; say "killed $key" ;;
-    status)      if [ -n "${2:-$run}" ]; then pick "${2:-$run}"; remote r_status "$key"; else remote r_ps "$name"; fi ;;
-    ps)          remote r_ps ;;
+    kill)        pick "${2:-}"; remote r_stop "$key" KILL; say "killed $label" ;;
+    status)      pick "${2:-}"; remote r_status "$key" ;;
+    ps)          case "${2:-}" in -a|all) remote r_ps ;; *) remote r_ps "$name" ;; esac ;;
+    clean)       if [ -n "${2:-}" ]; then remote r_clean "$name/$2"; else remote r_clean "$name"; fi ;;
     killall)     remote r_killall ;;
     exec)        shift; [ $# -gt 0 ] || die "exec: no command"
                  "${SSH[@]}" -t "cd $dir && ${env:+export $env &&} bash -lc $(printf '%q' "$*")" ;;
