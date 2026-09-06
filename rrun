@@ -144,11 +144,11 @@ r_start() {  # key dir env log_max_bytes command
     # a side loop rotates the log by copy + truncate when it passes $max bytes (the command keeps
     # its open fd; O_APPEND makes writes continue at the new end) and counts rotations in "gen"
     local w='st=$1 max=$2; shift 2; trap ":" INT; echo $$ > "$st/pid"
-        if [ "$max" -gt 0 ]; then ( trap "" INT; while sleep 5; do
+        if [ "$max" -gt 0 ]; then ( trap "" INT; while sleep 5 && [ ! -e "$st/exit" ]; do
             sz=$(stat -c %s "$st/log" 2>/dev/null || wc -c < "$st/log"); [ "$sz" -gt "$max" ] || continue
             cp "$st/log" "$st/log.1" && : > "$st/log"; echo $(( $(cat "$st/gen" 2>/dev/null || echo 0) + 1 )) > "$st/gen"
         done ) & fi
-        bash -lc "$1"; echo $? > "$st/exit"; { pkill -P $!; kill $!; wait $!; } 2>/dev/null'
+        bash -lc "$1"; echo $? > "$st/exit"; pkill -P $! 2>/dev/null; wait'
     # setsid --fork rather than `&`: a shell background job inherits SIGINT ignored, and that
     # would pass down to the command, so Ctrl-C could never stop it
     if setsid --help 2>&1 | grep -q -- --fork; then
