@@ -11,11 +11,11 @@ $ rrun uv run python examples/voice_agents/basic_agent.py dev
   1 file(s) changed
 [rrun]   .env (filtered)
 [rrun] synced
-[rrun] starting on root@vps: uv run python examples/voice_agents/basic_agent.py dev
+[rrun] starting agents/main on root@vps: uv run python examples/voice_agents/basic_agent.py dev
 2026-09-06 07:30:31 - INFO livekit.agents - registered worker {...}
-^C[rrun] stopping agents (Ctrl-C again to kill)
+^C[rrun] stopping agents/main (Ctrl-C again to kill)
 2026-09-06 07:30:50 - INFO livekit.agents - shutting down worker {...}
-[rrun] exited with code 130
+[rrun] agents/main exited with code 130
 ```
 
 ## Install
@@ -26,18 +26,20 @@ rrun is one bash script. The installer copies it to `~/.local/bin/rrun` and seed
 curl -fsSL https://raw.githubusercontent.com/longcw/rrun/main/install.sh | bash
 ```
 
-or `git clone https://github.com/longcw/rrun && rrun/install.sh`. `rrun update` re-runs the installer over the installed copy. Requirements: bash 3.2+, ssh, rsync locally; bash, rsync, `setsid` on the host (`rrun setup` installs rsync with apt, dnf, yum, apk, or pacman).
+or `git clone https://github.com/longcw/rrun && rrun/install.sh`. `rrun update` re-runs the installer over the installed copy. Requirements: bash 3.2+, ssh, rsync locally; bash, rsync, and util-linux `setsid` on the host (`rrun setup` installs rsync with apt, dnf, yum, apk, or pacman). Without `setsid --fork`, Ctrl-C can only stop programs that install their own SIGINT handler.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `rrun <command...>` | sync, then run the command on the host and stream its logs |
-| `rrun attach` (or `logs`) | re-attach to the running command: last 200 lines, then follow |
-| `rrun stop` | send SIGINT and stream logs until the command has exited |
-| `rrun kill` | send SIGKILL |
-| `rrun status` | what is running for this project on the host |
-| `rrun ps` | every rrun-managed run on the host |
+| `rrun <command...>` | sync, then run the command on the host as `<project>/main` and stream its logs |
+| `rrun -n <run> <command...>` | same, in another slot so it runs alongside `main` |
+| `rrun -N <command...>` | same, in a fresh slot with a generated name |
+| `rrun attach [run]` (or `logs`) | re-attach to a run: last 200 lines, then follow |
+| `rrun stop [run]` | send SIGINT and stream logs until the run has exited |
+| `rrun kill [run]` | send SIGKILL |
+| `rrun status [run]` | the project's runs on the host, or one run in detail |
+| `rrun ps` | every rrun-managed run on the host, all projects |
 | `rrun killall` | stop every rrun-managed run on the host (SIGINT, then SIGKILL after 30 s) |
 | `rrun sync` | rsync only |
 | `rrun exec <command...>` | run attached with a tty: interactive things, installers that prompt, `htop` |
@@ -47,7 +49,9 @@ or `git clone https://github.com/longcw/rrun && rrun/install.sh`. `rrun update` 
 | `rrun -H <host> ...` | use another host for this invocation |
 | `rrun -d <dir> ...` | use this remote folder for the project and remember it in `.rrun.conf` |
 
-While streaming, the first Ctrl-C sends SIGINT to the remote process group and keeps streaming until the group is gone. A second Ctrl-C sends SIGKILL. If the ssh stream dies, rrun reconnects and resumes from the last line it printed. Starting a new run first stops the previous one for the same project.
+Runs are named `<project>/<run>`, like docker containers. Without `-n` the run is `main`, and starting it replaces the previous `main`, so a forgotten worker never lingers. `-n load` uses a second slot that runs at the same time, and `attach load`, `stop load`, `status load` address it. `-N` never replaces anything.
+
+While streaming, the first Ctrl-C sends SIGINT to the remote process group and keeps streaming until the group is gone. A second Ctrl-C sends SIGKILL. If the ssh stream dies, rrun reconnects and resumes from the last line it printed.
 
 Commands are joined and run through `bash -lc` in the remote project dir, so pipes and redirects work when quoted:
 
@@ -86,7 +90,7 @@ filter config.yaml to_prod                     # any command, or a function defi
 to_prod() { sed 's/localhost/0.0.0.0/'; }
 ```
 
-The project root is the nearest parent with a `.rrun.conf`, else the git top level, else the current directory. Its basename is the project `name`, which keys the run state on the host under `~/.rrun/<name>/` (`log`, `pid`, `cmd`, `exit`).
+The project root is the nearest parent with a `.rrun.conf`, else the git top level, else the current directory. Its basename is the project `name`; each run keeps its state on the host under `~/.rrun/<name>/<run>/` (`log`, `pid`, `cmd`, `exit`), which stays after the run ends until that slot is started again.
 
 A `filter <file> <command>` line takes that file out of rsync; instead the local file is piped through the command and the output is written to the same path on the host. Use it when the same checkout should point at a different backend from the host, for example to activate a different block of `.env`. Repeat the line for more files.
 
@@ -105,4 +109,4 @@ A folder that is not a git repo is synced whole, minus `.rrunignore`.
 
 ## How it works
 
-Each ssh call ships a small bash library with `declare -f` and runs one function with `bash -s`, so nothing is installed on the host. The command is started with `setsid` under a wrapper that traps SIGINT, records the exit code, and stays the process-group leader, so `kill -- -pgid` reaches the whole tree. The local side tails the log through ssh in a subshell that ignores SIGINT, counts the lines it has shown, and reconnects from that line if the stream breaks.
+Each ssh call ships a small bash library with `declare -f` and runs one function with `bash -s`, so nothing is installed on the host. The command is started with `setsid --fork` under a wrapper that traps SIGINT, records the exit code, and stays the process-group leader, so `kill -- -pgid` reaches the whole tree. `--fork` matters: a shell background job would inherit SIGINT as ignored and pass that down to the command. The local side tails the log through ssh in a subshell that ignores SIGINT, counts the lines it has shown, and reconnects from that line if the stream breaks.
