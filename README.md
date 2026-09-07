@@ -40,7 +40,9 @@ or `git clone https://github.com/longcw/rrun && rrun/install.sh`. `rrun update` 
 | `rrun kill [run]` | send SIGKILL |
 | `rrun status [run]` | is the run alive, its processes or exit code |
 | `rrun ps [-a]` | this project's runs on the host; `-a` for every project |
-| `rrun clean [run]` | remove the project's run state on the host, stopping anything still running; or one run |
+| `rrun clean [run]` | stop the project's runs and remove their logs on the host; the synced dir stays; or one run |
+| `rrun projects` | every project on the host: remote dir, size, runs |
+| `rrun rm [name...\|--all]` | remove projects from the host entirely: runs, logs and the synced dir; asks first, `-y` skips |
 | `rrun killall` | stop every rrun-managed run on the host (SIGINT, then SIGKILL after 30 s) |
 | `rrun sync` | rsync only |
 | `rrun pull <path...>` | fetch files or folders from the remote project dir back into this one; never deletes locally, never pulls a filtered file |
@@ -95,7 +97,7 @@ filter config.yaml to_prod                     # any command, or a function defi
 to_prod() { sed 's/localhost/0.0.0.0/'; }
 ```
 
-The project root is the nearest parent with a `.rrun.conf`, else the git top level, else the current directory. Its basename is the project `name`; each run keeps its state on the host under `~/.rrun/<name>/<run>/` (`log`, `pid`, `cmd`, `exit`; the default run is `default`), which stays after the run ends until that slot is started again or `rrun clean` removes it.
+The project root is the nearest parent with a `.rrun.conf`, else the git top level, else the current directory. Its basename is the project `name`; each run keeps its state on the host under `~/.rrun/<name>/<run>/` (`log`, `pid`, `cmd`, `exit`; the default run is `default`), which stays after the run ends until that slot is started again or `rrun clean` removes it. `rrun projects` lists everything rrun put on a host, and `rrun rm <name>` takes a project off it again, including a finished worktree's `agents@fix-x` dir.
 
 Logs rotate: when a run's log passes `log_max` (default 50M, settable in the config or per project, `0` disables), it is copied to `log.1` and truncated in place, so at most two files of that size exist per run. The process keeps writing to the same open file. A follower that reconnects after a rotation says so and continues from the current file.
 

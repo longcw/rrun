@@ -4,7 +4,7 @@
 # so a dropped connection never kills it; the local side reconnects and keeps streaming.
 set -euo pipefail
 
-VERSION=0.7.0
+VERSION=0.8.0
 HOME_CFG="${RRUN_CONFIG:-$HOME/.config/rrun/config}"
 
 say() { printf '\033[1;36m[rrun]\033[0m %s\n' "$*" >&2; }
@@ -25,7 +25,9 @@ subcommand below acts on the default run unless a run name is given.
   kill [run]                    SIGKILL the run
   status [run]                  is the run alive, its processes or exit code
   ps [-a]                       this project's runs on the host; -a: every project
-  clean [run]                   remove the project's run state on the host (stops it first); or one run
+  clean [run]                   stop the project's runs and remove their logs on the host (the dir stays); or one run
+  projects                      every project on the host: dir, size, runs
+  rm [name...|--all]            remove projects from the host entirely: runs, logs and the synced dir (asks first)
   killall                       stop every rrun-managed run on the host (SIGINT, then SIGKILL)
   sync                          rsync only
   pull <path...>                fetch files or folders from the remote project dir back into this one
@@ -157,9 +159,10 @@ r_label() { case "$1" in */default) echo "${1%/default}" ;; *) echo "${1%/*}:${1
 r_pgid() { local p; p=$(cat "$HOME/.rrun/$1/pid" 2>/dev/null) && kill -0 -- "-$p" 2>/dev/null && echo "$p"; }
 r_stop() { local p; p=$(r_pgid "$1") || return 0; kill "-$2" -- "-$p" 2>/dev/null || true; }
 r_gone() { local i; for i in $(seq "$2"); do r_pgid "$1" >/dev/null || return 0; sleep 0.3; done; return 1; }
+r_register() { mkdir -p "$HOME/.rrun/$1"; printf '%s\n' "$2" > "$HOME/.rrun/$1/dir"; }
 r_start() {  # key dir env log_max_bytes command
     local n=$1 d env=$3 max=$4 cmd=$5 st="$HOME/.rrun/$1"; eval "d=$2"
-    mkdir -p "$st"
+    mkdir -p "$st"; r_register "${1%/*}" "$2"
     r_stop "$n" INT; r_gone "$n" 200 || r_stop "$n" KILL
     : > "$st/log"; rm -f "$st/exit" "$st/log.1" "$st/gen"; printf '%s\n' "$cmd" > "$st/cmd"
     cd "$d" 2>/dev/null || { echo "[rrun] remote dir $d is missing; run: rrun setup"; return 1; }
@@ -245,7 +248,41 @@ r_clean() {  # project or project/run: stop whatever is running there, then remo
         r_pgid "$k" >/dev/null && { echo "[rrun] stopping $(r_label "$k")"; r_stop "$k" INT; r_gone "$k" 100 || r_stop "$k" KILL; }
     done
     [ -n "$any" ] || [ -d "$HOME/.rrun/$1" ] || { echo "[rrun] no state for $1 on $(hostname)"; return 0; }
-    rm -rf "$HOME/.rrun/$1"; echo "[rrun] removed ~/.rrun/$1 on $(hostname)"
+    case "$1" in
+        */*) rm -rf "$HOME/.rrun/$1"; echo "[rrun] removed run state of $(r_label "$1") on $(hostname)" ;;
+        *)   rm -rf "$HOME/.rrun/$1"/*/; echo "[rrun] removed run state of $1 on $(hostname)" ;;
+    esac
+}
+r_dir() {  # project root: the project's dir from the registry, else <root>/<project> if that exists
+    local pd rootx; pd=$(cat "$HOME/.rrun/$1/dir" 2>/dev/null || true)
+    [ -n "$pd" ] || { eval "rootx=$2"; [ -d "$rootx/$1" ] && pd="$2/$1"; }
+    printf '%s' "$pd"
+}
+r_projects() {  # root: registered projects plus any folder under <root>, one line each
+    local rootx n pd pdx size total running r any="" names
+    eval "rootx=$1"
+    names=$( { ls "$HOME/.rrun" 2>/dev/null; ls "$rootx" 2>/dev/null; } | grep -v '^cm-' | sort -u )
+    for n in $names; do
+        [ -d "$HOME/.rrun/$n" ] || [ -d "$rootx/$n" ] || continue
+        [ -n "$any" ] || { any=1; printf '%-28s %-32s %-7s %s\n' PROJECT DIR SIZE RUNS; }
+        pd=$(r_dir "$n" "$1"); size="-"
+        [ -z "$pd" ] || { eval "pdx=$pd"; size=$(du -sh "$pdx" 2>/dev/null | cut -f1); size=${size:-gone}; }
+        total=0 running=0
+        for r in "$HOME/.rrun/$n"/*/; do [ -e "$r/cmd" ] || continue; total=$((total + 1)); r_pgid "$n/$(basename "$r")" >/dev/null && running=$((running + 1)); done
+        printf '%-28s %-32s %-7s %s\n' "$n" "${pd:-?}" "$size" "$running running / $total"
+    done
+    [ -n "$any" ] || echo "[rrun] no projects on $(hostname)"
+}
+r_rm() {  # project root: stop its runs, remove the synced dir and all state
+    local pd pdx; pd=$(r_dir "$1" "$2")
+    [ -d "$HOME/.rrun/$1" ] || [ -n "$pd" ] || { echo "[rrun] no project $1 on $(hostname)"; return 0; }
+    [ -d "$HOME/.rrun/$1" ] && r_clean "$1" >/dev/null
+    if [ -n "$pd" ]; then
+        eval "pdx=$pd"
+        case "$pdx" in ""|/|"$HOME"|"$HOME"/) echo "[rrun] refusing to remove $pdx"; return 1 ;; esac
+        rm -rf "$pdx"
+    fi
+    rm -rf "$HOME/.rrun/$1"; echo "[rrun] removed $1${pd:+ ($pd)} from $(hostname)"
 }
 r_setup() {  # dir
     local d; eval "d=$1"; mkdir -p "$d" "$HOME/.rrun"
@@ -258,7 +295,7 @@ r_setup() {  # dir
     elif command -v pacman >/dev/null; then pacman -S --noconfirm --quiet rsync
     else echo "[rrun] no known package manager; install rsync by hand"; return 1; fi
 }
-R_LIB=$(declare -f r_label r_pgid r_stop r_gone r_start r_follow r_exit r_status r_ps r_killall r_clean r_setup)
+R_LIB=$(declare -f r_label r_pgid r_stop r_gone r_register r_start r_follow r_exit r_status r_ps r_killall r_clean r_dir r_projects r_rm r_setup)
 
 # one probe per invocation: a host that is down or misnamed fails here with ssh's reason on one line,
 # instead of surfacing later as a wall of rsync errors; it also opens the multiplexed connection
@@ -344,6 +381,7 @@ sync() {
         *) die "rsync to $target:$dir failed: $(grep -vE '^rsync\(|^[[:space:]]*$' "$err" | head -n 1) (no rsync on the host? try: rrun setup)" ;;
     esac
     rm -f "$ex" "$err" "$out"
+    remote r_register "$name" "$dir"
     while [ "$i" -lt "${#filt_paths[@]}" ]; do
         f="${filt_paths[$i]}"
         if [ -f "$ROOT/$f" ]; then
@@ -423,6 +461,21 @@ case "${1:-}" in
     status)      pick "${2:-}"; remote r_status "$key" ;;
     ps)          case "${2:-}" in -a|all) remote r_ps ;; *) remote r_ps "$name" ;; esac ;;
     clean)       if [ -n "${2:-}" ]; then remote r_clean "$name/$2"; else remote r_clean "$name"; fi ;;
+    projects)    remote r_projects "$root" ;;
+    rm)          shift
+                 if [ "${1:-}" = "--all" ] || [ "${1:-}" = "-a" ]; then
+                     set -- $(remote r_projects "$root" | awk 'NR > 1 && $1 != "[rrun]" { print $1 }')
+                     [ $# -gt 0 ] || die "no projects on $target"
+                 fi
+                 [ $# -gt 0 ] || set -- "$name"
+                 say "this removes from $target, runs, logs and synced dir included:"
+                 remote r_projects "$root" | awk -v want=" $* " 'NR == 1 || index(want, " " $1 " ")' >&2
+                 if [ -z "$yes" ]; then
+                     [ -t 0 ] || die "not removing without confirmation: run interactively or pass -y"
+                     printf '\033[1;36m[rrun]\033[0m remove? [y/N] ' >&2; read -r l </dev/tty
+                     case "$l" in y|Y|yes) ;; *) die "nothing removed" ;; esac
+                 fi
+                 for l in "$@"; do remote r_rm "$l" "$root"; done ;;
     killall)     remote r_killall ;;
     exec)        shift; [ $# -gt 0 ] || die "exec: no command"; check_host
                  "${SSH[@]}" -t "cd $dir 2>/dev/null || cd; ${env:+export $env;} bash -lc $(printf '%q' "$*")" ;;
