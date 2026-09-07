@@ -4,7 +4,7 @@
 # so a dropped connection never kills it; the local side reconnects and keeps streaming.
 set -euo pipefail
 
-VERSION=0.6.1
+VERSION=0.7.0
 HOME_CFG="${RRUN_CONFIG:-$HOME/.config/rrun/config}"
 
 say() { printf '\033[1;36m[rrun]\033[0m %s\n' "$*" >&2; }
@@ -39,7 +39,8 @@ subcommand below acts on the default run unless a run name is given.
                                 (default: <root>/<folder name>, root = ~/rrun or `root = ...` in the config)
 
 The first sync from a folder without a .rrun.conf shows what would be uploaded and asks first;
-confirming writes the .rrun.conf. `rrun exec` never syncs.
+confirming writes the .rrun.conf. `rrun exec` never syncs. A git worktree inherits the main
+checkout's .rrun.conf and gets its own remote dir and runs, <dir>@<worktree> and <name>@<worktree>.
 
 Commands are joined and run with `bash -lc` in the remote project dir, so quote pipes:
   rrun 'curl -LsSf https://astral.sh/uv/install.sh | sh'
@@ -68,8 +69,25 @@ host="" dir="" name="" env="" log_max="" filt_paths=() filt_cmds=()
 # `filter <file> <command>` in .rrun.conf: the file is not rsynced; it is piped through the command
 # (a function from the conf or any shell command) and the output written to the same path on the host
 filter() { filt_paths+=("$1"); filt_cmds+=("$2"); }
+# a git worktree inherits the main checkout's .rrun.conf but gets its own remote dir and run state,
+# <dir>@<worktree> and <name>@<worktree>, unless its own .rrun.conf says otherwise
+main_root=""
+if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    common=$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    if [ -n "$common" ] && [ "$(dirname "$common")" != "$ROOT" ] && [ -f "$(dirname "$common")/.rrun.conf" ]; then
+        main_root="$(dirname "$common")"
+        # shellcheck disable=SC1091
+        . "$main_root/.rrun.conf"
+    fi
+fi
+wt_dir="$dir" wt_name="$name"
 # shellcheck disable=SC1091
 [ -f "$ROOT/.rrun.conf" ] && . "$ROOT/.rrun.conf"
+if [ -n "$main_root" ]; then
+    wt="$(basename "$ROOT")"
+    [ "$name" != "$wt_name" ] || name="${name:-$(basename "$main_root")}@$wt"
+    [ "$dir" != "$wt_dir" ] || [ -z "$dir" ] || dir="$dir@$wt"
+fi
 cfg() { [ -f "$HOME_CFG" ] || return 0; sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$HOME_CFG" | tail -n 1; }
 
 spec="${RRUN_HOST:-}" dir_arg="" run="" yes=""
@@ -295,7 +313,8 @@ sync() {
     set -- -az --delete --copy-unsafe-links -e "ssh $SSH_OPTS" --rsync-path="mkdir -p $dir && rsync" \
         ${inc[@]+"${inc[@]}"} ${exc[@]+"${exc[@]}"} --exclude-from="$ex" "$ROOT/" "$target:$dir/"
     # a folder without .rrun.conf has never been synced from: show what would go up and ask first
-    if [ ! -f "$ROOT/.rrun.conf" ]; then
+    [ -z "$main_root" ] || say "worktree of $main_root, inheriting its .rrun.conf"
+    if [ ! -f "$ROOT/.rrun.conf" ] && [ -z "$main_root" ]; then
         local n
         if [ "$ROOT" = "$HOME" ] || [ "$ROOT" = / ]; then n="not scanned"
         else

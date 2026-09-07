@@ -99,7 +99,9 @@ The project root is the nearest parent with a `.rrun.conf`, else the git top lev
 
 Logs rotate: when a run's log passes `log_max` (default 50M, settable in the config or per project, `0` disables), it is copied to `log.1` and truncated in place, so at most two files of that size exist per run. The process keeps writing to the same open file. A follower that reconnects after a rotation says so and continues from the current file.
 
-A `filter <file> <command>` line takes that file out of rsync; instead the local file is piped through the command and the output is written to the same path on the host. Use it when the same checkout should point at a different backend from the host, for example to activate a different block of `.env`. Repeat the line for more files.
+A **Git worktrees** inherit the main checkout's `.rrun.conf`, so filters and env carry over without copying, but each worktree is its own project on the host: the remote dir becomes `<dir>@<worktree>` and runs show as `<name>@<worktree>`, so branches never overwrite each other. A `.rrun.conf` inside the worktree overrides any of that. Tools with a shared cache, like uv, hardlink a second environment from the cache, so the extra venv costs little disk.
+
+`filter <file> <command>` line takes that file out of rsync; instead the local file is piped through the command and the output is written to the same path on the host. Use it when the same checkout should point at a different backend from the host, for example to activate a different block of `.env`. Repeat the line for more files.
 
 ## What gets synced
 
